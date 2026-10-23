@@ -261,6 +261,17 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 
+def ensure_schema() -> None:
+    """Crée les tables manquantes (sans toucher aux données) : utile quand la connexion en cache est ancienne."""
+    conn = get_connection()
+    with _WRITE_LOCK:
+        try:
+            conn.executescript(SCHEMA)
+            conn.commit()
+        except sqlite3.Error:
+            log.exception("Mise à jour du schéma impossible")
+
+
 def default_admin_password() -> str:
     try:
         if "BTP_ADMIN_PASSWORD" in st.secrets:
@@ -632,14 +643,18 @@ def ensure_demo_data() -> None:
     if st.session_state.get("_demo_checked"):
         return
     st.session_state["_demo_checked"] = True
-    conn = get_connection()
-    if conn.execute("SELECT 1 FROM meta WHERE key = 'equipes_demo_v2'").fetchone():
-        return
-    nb = conn.execute("SELECT COUNT(*) FROM chantiers").fetchone()[0]
-    nb_demo = conn.execute("SELECT COUNT(*) FROM chantiers WHERE nom LIKE '%(démo)%'").fetchone()[0]
-    if nb == 0 or nb_demo > 0:  # base vide, ou chantiers d'exemple déjà présents à compléter
-        seed_intervenants_demo()
-    db_write("INSERT OR REPLACE INTO meta (key, value) VALUES ('equipes_demo_v2', '1')")
+    try:
+        ensure_schema()
+        conn = get_connection()
+        if conn.execute("SELECT 1 FROM meta WHERE key = 'equipes_demo_v2'").fetchone():
+            return
+        nb = conn.execute("SELECT COUNT(*) FROM chantiers").fetchone()[0]
+        nb_demo = conn.execute("SELECT COUNT(*) FROM chantiers WHERE nom LIKE '%(démo)%'").fetchone()[0]
+        if nb == 0 or nb_demo > 0:  # base vide, ou chantiers d'exemple déjà présents à compléter
+            seed_intervenants_demo()
+        db_write("INSERT OR REPLACE INTO meta (key, value) VALUES ('equipes_demo_v2', '1')")
+    except sqlite3.Error:
+        log.exception("Création des données d'exemple impossible")  # ne jamais bloquer l'application
 
 
 def hero_data() -> tuple[list[tuple[str, int]], float | None]:
@@ -2776,6 +2791,7 @@ def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="🏗️", layout="wide")
     try:
         get_connection()
+        ensure_schema()
     except sqlite3.Error as exc:
         st.error(f"Impossible d'ouvrir la base de données : {exc}")
         st.stop()
