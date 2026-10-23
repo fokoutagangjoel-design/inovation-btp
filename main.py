@@ -6,8 +6,14 @@ Points clés de cette version :
   de ce fichier. La connexion à la base est créée UNE seule fois avec
   ``st.cache_resource`` et ``check_same_thread=False`` (compatible Streamlit Cloud).
 * Connexion sécurisée (mots de passe hachés PBKDF2, rôles admin / gestionnaire / lecteur).
-* Modules : tableau de bord, chantiers, clients, devis, stock, personnel, dépenses,
-  rapports/exports, paramètres.
+* Modules : tableau de bord, chantiers, intervenants, clients, devis, marchés BTP,
+  stock, personnel, dépenses, rapports/exports, paramètres.
+
+NOUVEAUTÉS
+* « Intervenants » : fiche par chantier (ingénieur, technicien, manœuvres, plombiers,
+  ferrailleurs, contrôleurs techniques) avec n°, nom, téléphone, taux journalier.
+* « Marchés BTP » : appels d'offres, prix des matériaux, offres des concurrents,
+  probabilité de gain et prix conseillé (maximise le gain espéré), simulateur.
 
 Lancer en local :  streamlit run app.py
 """
@@ -17,6 +23,7 @@ import hashlib
 import hmac
 import io
 import logging
+import math
 import os
 import re
 import secrets
@@ -25,6 +32,7 @@ import threading
 from datetime import date, datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -51,6 +59,20 @@ CATEGORIES_DEPENSE = [
 UNITES = ["u", "m", "m²", "m³", "kg", "t", "sac", "L", "h", "forfait"]
 ROLES = ["admin", "gestionnaire", "lecteur"]
 HEURES_PAR_JOUR = 8
+
+# --- Intervenants de chantier ---
+FONCTIONS_CHANTIER = [
+    "Ingénieur",
+    "Technicien",
+    "Manœuvre",
+    "Plombier",
+    "Ferrailleur",
+    "Contrôleur technique",
+]
+
+# --- Marchés BTP ---
+STATUTS_AO = ["À étudier", "Soumis", "Gagné", "Perdu", "Abandonné"]
+POIDS_PRIOR = 5  # nombre d'observations "virtuelles" donné à l'hypothèse de départ
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("innovation_btp")
@@ -142,6 +164,42 @@ CREATE TABLE IF NOT EXISTS devis_lignes (
     unite TEXT NOT NULL DEFAULT 'u',
     prix_unitaire REAL NOT NULL CHECK (prix_unitaire >= 0)
 );
+CREATE TABLE IF NOT EXISTS affectations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chantier_id INTEGER NOT NULL REFERENCES chantiers(id) ON DELETE CASCADE,
+    employe_id INTEGER NOT NULL REFERENCES employes(id) ON DELETE CASCADE,
+    fonction TEXT NOT NULL,
+    UNIQUE (chantier_id, employe_id)
+);
+CREATE TABLE IF NOT EXISTS appels_offres (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reference TEXT NOT NULL UNIQUE,
+    intitule TEXT NOT NULL,
+    maitre_ouvrage TEXT,
+    localisation TEXT,
+    date_limite TEXT,
+    estimation REAL NOT NULL DEFAULT 0,
+    cout_estime REAL NOT NULL DEFAULT 0,
+    notre_offre REAL NOT NULL DEFAULT 0,
+    nb_concurrents INTEGER NOT NULL DEFAULT 4,
+    statut TEXT NOT NULL DEFAULT 'À étudier',
+    attributaire TEXT,
+    notes TEXT
+);
+CREATE TABLE IF NOT EXISTS concurrents_offres (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    appel_id INTEGER NOT NULL REFERENCES appels_offres(id) ON DELETE CASCADE,
+    entreprise TEXT NOT NULL,
+    montant REAL NOT NULL CHECK (montant > 0)
+);
+CREATE TABLE IF NOT EXISTS prix_marche (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    materiau TEXT NOT NULL,
+    unite TEXT NOT NULL DEFAULT 'u',
+    fournisseur TEXT NOT NULL,
+    prix REAL NOT NULL CHECK (prix > 0),
+    date TEXT NOT NULL
+);
 """
 
 
@@ -213,7 +271,7 @@ def ensure_admin(conn: sqlite3.Connection) -> None:
         log.info("Compte administrateur initial créé.")
 
 
-def db_write(sql: str, params: tuple = ()) -> int | None:
+def db_write(sql: str, params: tuple | dict = ()) -> int | None:
     """Exécute une écriture. Retourne lastrowid, ou None si une erreur survient."""
     conn = get_connection()
     with _WRITE_LOCK:
@@ -720,10 +778,1168 @@ def show_chantier_detail(cid: int) -> None:
     st.write(f"**Statut :** {ch['statut']} · **Période :** {ch['date_debut']} → {ch['date_fin_prevue']}")
     if ch["notes"]:
         st.write(f"**Notes :** {ch['notes']}")
+
+    team = team_frame(cid)
+    st.write("**Intervenants du chantier**")
+    if team.empty:
+        st.caption("Aucun intervenant affecté. Utilisez la page « Intervenants ».")
+    else:
+        st.dataframe(team_display(team), hide_index=True, use_container_width=True)
+
     if not depenses.empty:
         st.write("**Dépenses du chantier**")
         st.dataframe(depenses.drop(columns=["chantier_id"]), hide_index=True, use_container_width=True)
         st.bar_chart(depenses.groupby("categorie")["montant"].sum())
+
+
+# --------------------------------------------------------------------------- #
+# Intervenants des chantiers (ingénieur, technicien, manœuvres, plombiers…)
+# --------------------------------------------------------------------------- #
+EQUIPE_TYPE = [
+    ("Ingénieur", 1),
+    ("Technicien", 1),
+    ("Manœuvre", 4),
+    ("Plombier", 2),
+    ("Ferrailleur", 2),
+    ("Contrôleur technique", 1),
+]
+TAUX_FONCTION = {
+    "Ingénieur": 25000,
+    "Technicien": 15000,
+    "Manœuvre": 5000,
+    "Plombier": 8000,
+    "Ferrailleur": 8000,
+    "Contrôleur technique": 20000,
+}
+DEMO_CHANTIERS = [
+    {
+        "nom": "Immeuble R+3 Bonamoussadi (démo)",
+        "localisation": "Douala",
+        "debut": "2026-03-02",
+        "fin": "2027-04-30",
+        "budget": 180_000_000,
+        "avancement": 45,
+    },
+    {
+        "nom": "Villa duplex Bastos (démo)",
+        "localisation": "Yaoundé",
+        "debut": "2026-05-18",
+        "fin": "2027-02-28",
+        "budget": 65_000_000,
+        "avancement": 60,
+    },
+    {
+        "nom": "Pont de desserte Kribi (démo)",
+        "localisation": "Kribi",
+        "debut": "2026-01-12",
+        "fin": "2027-06-30",
+        "budget": 320_000_000,
+        "avancement": 30,
+    },
+    {
+        "nom": "Entrepôt logistique Bafoussam (démo)",
+        "localisation": "Bafoussam",
+        "debut": "2026-04-06",
+        "fin": "2027-01-29",
+        "budget": 95_000_000,
+        "avancement": 70,
+    },
+]
+PRENOMS = [
+    "Jean", "Paul", "Marie", "Alain", "Brice", "Carine", "Didier", "Estelle", "Fabrice", "Grâce",
+    "Hervé", "Irène", "Joël", "Kevin", "Landry", "Mireille", "Nadège", "Olivier", "Patrice", "Rodrigue",
+]
+NOMS = [
+    "Mbarga", "Nkoulou", "Tchinda", "Fotso", "Essomba", "Kamga", "Ndongo", "Abena", "Mvondo", "Tagne",
+    "Ngassa", "Owona", "Biyiha", "Djoumessi", "Fouda", "Atangana", "Njoya", "Kouam", "Eyenga", "Ewane",
+]
+
+
+def team_frame(cid: int) -> pd.DataFrame:
+    """Équipe d'un chantier, triée par fonction, avec une colonne N°."""
+    df = query(
+        "SELECT a.id AS affectation_id, e.id AS employe_id, e.nom, a.fonction, e.telephone, e.taux_journalier "
+        "FROM affectations a JOIN employes e ON e.id = a.employe_id WHERE a.chantier_id = ?",
+        (cid,),
+    )
+    if df.empty:
+        return df
+    df["_ordre"] = df["fonction"].map({f: i for i, f in enumerate(FONCTIONS_CHANTIER)}).fillna(99)
+    df = df.sort_values(["_ordre", "nom"]).drop(columns="_ordre").reset_index(drop=True)
+    df.insert(0, "N°", range(1, len(df) + 1))
+    return df
+
+
+def team_display(team: pd.DataFrame) -> pd.DataFrame:
+    return team.drop(columns=["affectation_id", "employe_id"]).rename(
+        columns={
+            "nom": "Nom",
+            "fonction": "Fonction",
+            "telephone": "Téléphone",
+            "taux_journalier": f"Taux journalier ({DEVISE})",
+        }
+    )
+
+
+def seed_intervenants_demo() -> int:
+    """Crée 4 chantiers « En cours » avec leur équipe type. Retourne le nombre de chantiers créés."""
+    conn = get_connection()
+    created = 0
+    counter = 0
+    with _WRITE_LOCK:
+        try:
+            for ch in DEMO_CHANTIERS:
+                if conn.execute("SELECT 1 FROM chantiers WHERE nom = ?", (ch["nom"],)).fetchone():
+                    continue
+                cur = conn.execute(
+                    "INSERT INTO chantiers (nom, localisation, date_debut, date_fin_prevue, budget, "
+                    "statut, avancement, notes) VALUES (?,?,?,?,?, 'En cours', ?, ?)",
+                    (
+                        ch["nom"],
+                        ch["localisation"],
+                        ch["debut"],
+                        ch["fin"],
+                        ch["budget"],
+                        ch["avancement"],
+                        "Données d'exemple : à remplacer par vos vrais chantiers et intervenants.",
+                    ),
+                )
+                cid = cur.lastrowid
+                for fonction, effectif in EQUIPE_TYPE:
+                    for _ in range(effectif):
+                        i = counter
+                        counter += 1
+                        nom = f"{PRENOMS[i % len(PRENOMS)]} {NOMS[(i * 3 + i // 20) % len(NOMS)]}"
+                        tel = f"+237 690 00 {i:02d} {(i * 7) % 100:02d}"
+                        emp = conn.execute(
+                            "INSERT INTO employes (nom, poste, telephone, taux_journalier, actif) "
+                            "VALUES (?,?,?,?,1)",
+                            (nom, fonction, tel, TAUX_FONCTION[fonction]),
+                        )
+                        conn.execute(
+                            "INSERT INTO affectations (chantier_id, employe_id, fonction) VALUES (?,?,?)",
+                            (cid, emp.lastrowid, fonction),
+                        )
+                created += 1
+            conn.commit()
+        except sqlite3.Error as exc:
+            conn.rollback()
+            log.exception("Création des données d'exemple annulée")
+            st.error(f"Opération annulée : {exc}")
+            return 0
+    return created
+
+
+def sheet_name(cid: int, nom: str) -> str:
+    return re.sub(r"[\[\]:*?/\\]", "", f"{cid}-{nom}")[:31]
+
+
+def show_fiche_intervenants() -> None:
+    statuts = st.multiselect(
+        "Statut des chantiers affichés", STATUTS_CHANTIER, default=["En cours"], key="int_statuts"
+    )
+    if not statuts:
+        st.info("Choisissez au moins un statut.")
+        return
+    marks = ",".join("?" * len(statuts))
+    chantiers = query(
+        f"SELECT id, nom, localisation, statut, avancement FROM chantiers WHERE statut IN ({marks}) ORDER BY nom",
+        tuple(statuts),
+    )
+    if chantiers.empty:
+        st.info("Aucun chantier avec ce statut. Créez-en dans « Chantiers » ou chargez les données d'exemple.")
+        return
+
+    teams = {int(r["id"]): team_frame(int(r["id"])) for _, r in chantiers.iterrows()}
+    rows = []
+    for n, (_, r) in enumerate(chantiers.iterrows(), start=1):
+        team = teams[int(r["id"])]
+        counts = team["fonction"].value_counts() if not team.empty else pd.Series(dtype=int)
+        row = {
+            "N°": n,
+            "Chantier": r["nom"],
+            "Localisation": r["localisation"] or "—",
+            "Avancement %": int(r["avancement"]),
+        }
+        for f in FONCTIONS_CHANTIER:
+            row[f] = int(counts.get(f, 0))
+        row["Effectif total"] = len(team)
+        manquants = [f for f in FONCTIONS_CHANTIER if row[f] == 0]
+        row["Postes manquants"] = ", ".join(manquants) if manquants else "—"
+        rows.append(row)
+    recap = pd.DataFrame(rows)
+
+    c1, c2 = st.columns(2)
+    c1.metric("Chantiers affichés", len(recap))
+    c2.metric("Intervenants affectés", int(recap["Effectif total"].sum()))
+    st.subheader("Récapitulatif par chantier")
+    st.dataframe(recap, hide_index=True, use_container_width=True)
+    incomplets = recap[recap["Postes manquants"] != "—"]
+    if not incomplets.empty:
+        st.warning(f"{len(incomplets)} chantier(s) avec au moins une fonction sans intervenant.")
+
+    st.subheader("Fiche détaillée de chaque chantier")
+    sheets: dict[str, pd.DataFrame] = {"Récapitulatif": recap}
+    for idx, (_, r) in enumerate(chantiers.iterrows()):
+        cid = int(r["id"])
+        team = teams[cid]
+        with st.expander(f"{r['nom']} — {r['localisation'] or 'lieu non précisé'} ({len(team)} intervenant(s))", expanded=idx == 0):
+            if team.empty:
+                st.caption("Aucun intervenant affecté à ce chantier.")
+            else:
+                shown = team_display(team)
+                st.dataframe(shown, hide_index=True, use_container_width=True)
+                sheets[sheet_name(cid, r["nom"])] = shown
+    st.download_button(
+        "⬇️ Télécharger la fiche des intervenants (Excel)",
+        data=excel_bytes(sheets),
+        file_name=f"intervenants_chantiers_{date.today().isoformat()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+def show_affectations_editor() -> None:
+    chantiers = choice_map("SELECT id, nom FROM chantiers ORDER BY nom")
+    if not chantiers:
+        st.info("Créez d'abord un chantier.")
+        return
+    cid = st.selectbox("Chantier", list(chantiers), format_func=chantiers.get, key="aff_chantier")
+    team = team_frame(cid)
+    if team.empty:
+        st.caption("Aucun intervenant affecté à ce chantier.")
+    else:
+        st.dataframe(team_display(team), hide_index=True, use_container_width=True)
+    if not can_edit():
+        read_only_notice()
+        return
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.write("**Affecter un employé existant**")
+        dispo = choice_map(
+            "SELECT id, nom || ' — ' || COALESCE(poste, '') FROM employes WHERE actif = 1 AND id NOT IN "
+            f"(SELECT employe_id FROM affectations WHERE chantier_id = {int(cid)}) ORDER BY nom"
+        )
+        if not dispo:
+            st.caption("Aucun employé disponible : créez un nouvel intervenant à droite.")
+        else:
+            with st.form(f"aff_add_{cid}", clear_on_submit=True):
+                eid = st.selectbox("Employé", list(dispo), format_func=dispo.get, key=f"aff_emp_{cid}")
+                fonction = st.selectbox("Fonction", FONCTIONS_CHANTIER, key=f"aff_fonc_{cid}")
+                if st.form_submit_button("Affecter", type="primary"):
+                    if db_write(
+                        "INSERT INTO affectations (chantier_id, employe_id, fonction) VALUES (?,?,?)",
+                        (cid, eid, fonction),
+                    ) is not None:
+                        flash("Intervenant affecté.")
+                        st.rerun()
+    with col_b:
+        st.write("**Créer un nouvel intervenant**")
+        with st.form(f"aff_new_{cid}", clear_on_submit=True):
+            nom = st.text_input("Nom complet *", key=f"new_nom_{cid}")
+            tel = st.text_input("Téléphone", key=f"new_tel_{cid}")
+            taux = st.number_input(
+                f"Taux journalier ({DEVISE})", min_value=0.0, step=500.0, format="%.0f", key=f"new_taux_{cid}"
+            )
+            fonction = st.selectbox("Fonction", FONCTIONS_CHANTIER, key=f"new_fonc_{cid}")
+            if st.form_submit_button("Créer et affecter", type="primary"):
+                if not nom.strip():
+                    st.error("Le nom est obligatoire.")
+                elif not valid_phone(tel):
+                    st.error("Numéro de téléphone invalide.")
+                else:
+                    eid = db_write(
+                        "INSERT INTO employes (nom, poste, telephone, taux_journalier) VALUES (?,?,?,?)",
+                        (nom.strip(), fonction, tel.strip(), taux),
+                    )
+                    if eid is not None and db_write(
+                        "INSERT INTO affectations (chantier_id, employe_id, fonction) VALUES (?,?,?)",
+                        (cid, eid, fonction),
+                    ) is not None:
+                        flash("Intervenant créé et affecté.")
+                        st.rerun()
+
+    if not team.empty:
+        st.divider()
+        labels = {
+            int(r["affectation_id"]): f"{int(r['N°'])} · {r['nom']} ({r['fonction']})" for _, r in team.iterrows()
+        }
+        aid = st.selectbox("Retirer un intervenant du chantier", list(labels), format_func=labels.get, key=f"aff_del_{cid}")
+        if st.button("Retirer du chantier", key=f"aff_del_btn_{cid}"):
+            if db_write("DELETE FROM affectations WHERE id = ?", (aid,)) is not None:
+                flash("Intervenant retiré du chantier.")
+                st.rerun()
+
+
+def page_intervenants() -> None:
+    st.header("🧑‍🔧 Intervenants des chantiers")
+    st.caption("Ingénieur, technicien, manœuvres, plombiers, ferrailleurs et contrôleurs techniques par chantier.")
+    tab_fiche, tab_aff, tab_demo = st.tabs(["Fiche des chantiers", "Affecter / retirer", "Données d'exemple"])
+    with tab_fiche:
+        show_fiche_intervenants()
+    with tab_aff:
+        show_affectations_editor()
+    with tab_demo:
+        st.write(
+            "Crée **4 chantiers « En cours »** (Douala, Yaoundé, Kribi, Bafoussam) avec, pour chacun, "
+            "1 ingénieur, 1 technicien, 4 manœuvres, 2 plombiers, 2 ferrailleurs et 1 contrôleur technique "
+            "(11 personnes par chantier)."
+        )
+        st.caption(
+            "Noms, numéros de téléphone et taux sont fictifs : remplacez-les par vos données réelles "
+            "dans l'onglet « Affecter / retirer » ou dans « Personnel »."
+        )
+        if not can_edit():
+            read_only_notice()
+        elif st.button("Créer les chantiers et équipes d'exemple", type="primary", key="seed_int"):
+            created = seed_intervenants_demo()
+            if created:
+                flash(f"{created} chantier(s) d'exemple créé(s).")
+                st.rerun()
+            else:
+                st.info("Les chantiers d'exemple existent déjà.")
+
+
+# --------------------------------------------------------------------------- #
+# Marchés BTP : modèle de probabilité
+# --------------------------------------------------------------------------- #
+def norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def competitor_model(prior_mu: float, prior_sigma: float) -> dict:
+    """Estime comment les concurrents proposent leurs prix (en % de l'estimation du maître d'ouvrage).
+
+    Part d'une hypothèse de départ puis la corrige avec les offres réellement enregistrées :
+    plus il y a d'observations, plus l'historique pèse.
+    """
+    df = query(
+        "SELECT c.montant AS montant, a.estimation AS estimation FROM concurrents_offres c "
+        "JOIN appels_offres a ON a.id = c.appel_id WHERE a.estimation > 0 AND c.montant > 0"
+    )
+    n = len(df)
+    if n == 0:
+        return {"mu": prior_mu, "sigma": prior_sigma, "n": 0}
+    ratios = df["montant"] / df["estimation"]
+    w = n / (n + POIDS_PRIOR)
+    std = float(ratios.std(ddof=0)) if n > 1 else prior_sigma
+    mu = w * float(ratios.mean()) + (1 - w) * prior_mu
+    sigma = max(w * std + (1 - w) * prior_sigma, 0.02)
+    return {"mu": mu, "sigma": sigma, "n": n}
+
+
+def win_probability(
+    price: float, estimation: float, model: dict, n_unknown: int, known_bids: list[float]
+) -> float:
+    """Probabilité d'être le moins-disant avec ce prix.
+
+    * offres connues : on gagne seulement si on passe sous la plus basse ;
+    * concurrents encore inconnus : on suppose des offres ~ Normale(mu, sigma) autour de l'estimation.
+    """
+    if known_bids and price >= min(known_bids):
+        return 0.0
+    if estimation <= 0:
+        return 0.0
+    p_beat_one = 1.0 - norm_cdf((price / estimation - model["mu"]) / model["sigma"])
+    return p_beat_one ** max(n_unknown, 0)
+
+
+def evaluate_prices(
+    prices, estimation: float, cout: float, model: dict, n_unknown: int, known_bids: list[float]
+) -> pd.DataFrame:
+    rows = []
+    for p in prices:
+        pw = win_probability(float(p), estimation, model, n_unknown, known_bids)
+        rows.append(
+            {
+                "prix": float(p),
+                "proba": pw,
+                "esperance": pw * (float(p) - cout),
+                "marge_pct": (float(p) - cout) / cout * 100 if cout > 0 else 0.0,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def optimise_price(
+    estimation: float,
+    cout: float,
+    model: dict,
+    n_unknown: int,
+    known_bids: list[float],
+    marge_min_pct: float,
+    plafond_pct: float,
+) -> dict | None:
+    """Prix qui maximise le gain espéré = probabilité de gain x marge. None si le marché n'est pas rentable."""
+    if estimation <= 0 or cout <= 0:
+        return None
+    plancher = cout * (1 + marge_min_pct / 100)
+    plafond = estimation * plafond_pct / 100
+    if plancher > plafond:
+        return None
+    prices = list(np.linspace(plancher, plafond, 150))
+    if known_bids:
+        juste_sous = min(known_bids) * 0.995
+        if plancher <= juste_sous <= plafond:
+            prices.append(juste_sous)
+    df = evaluate_prices(prices, estimation, cout, model, n_unknown, known_bids)
+    best = df.loc[df["esperance"].idxmax()]
+    return {
+        "prix": float(best["prix"]),
+        "proba": float(best["proba"]),
+        "marge_pct": float(best["marge_pct"]),
+        "esperance": float(best["esperance"]),
+    }
+
+
+def verdict(best: dict | None) -> str:
+    if best is None:
+        return "⛔ Non rentable"
+    if best["proba"] >= 0.5:
+        return "🟢 Favorable"
+    if best["proba"] >= 0.25:
+        return "🟠 Incertain"
+    return "🔴 Difficile"
+
+
+def known_bids_by_tender() -> dict[int, list[float]]:
+    bids = query("SELECT appel_id, montant FROM concurrents_offres")
+    out: dict[int, list[float]] = {}
+    for _, r in bids.iterrows():
+        out.setdefault(int(r["appel_id"]), []).append(float(r["montant"]))
+    return out
+
+
+def rank_opportunities(model: dict, marge_min: float, plafond: float) -> tuple[pd.DataFrame, list[str]]:
+    """Classe les marchés ouverts par gain espéré décroissant."""
+    tenders = query("SELECT * FROM appels_offres WHERE statut IN ('À étudier', 'Soumis')")
+    bids = known_bids_by_tender()
+    rows, incomplets = [], []
+    for _, t in tenders.iterrows():
+        estimation, cout = float(t["estimation"]), float(t["cout_estime"])
+        if estimation <= 0 or cout <= 0:
+            incomplets.append(str(t["reference"]))
+            continue
+        known = bids.get(int(t["id"]), [])
+        n_unknown = max(int(t["nb_concurrents"]) - len(known), 0)
+        best = optimise_price(estimation, cout, model, n_unknown, known, marge_min, plafond)
+        offre = float(t["notre_offre"])
+        proba_offre = (
+            win_probability(offre, estimation, model, n_unknown, known)
+            if t["statut"] == "Soumis" and offre > 0
+            else np.nan
+        )
+        rows.append(
+            {
+                "Référence": t["reference"],
+                "Intitulé": t["intitule"],
+                "Statut": t["statut"],
+                "Date limite": t["date_limite"],
+                "Estimation": estimation,
+                "Coût estimé": cout,
+                "Prix conseillé": best["prix"] if best else np.nan,
+                "Proba de gain": best["proba"] * 100 if best else 0.0,
+                "Marge %": best["marge_pct"] if best else np.nan,
+                "Gain espéré": best["esperance"] if best else 0.0,
+                "Verdict": verdict(best),
+                "Proba avec votre offre": proba_offre * 100 if not pd.isna(proba_offre) else np.nan,
+            }
+        )
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values("Gain espéré", ascending=False).reset_index(drop=True)
+        df.insert(0, "Rang", range(1, len(df) + 1))
+    return df, incomplets
+
+
+# --------------------------------------------------------------------------- #
+# Marchés BTP : données d'exemple
+# --------------------------------------------------------------------------- #
+DEMO_AO_CLOS = [
+    {
+        "reference": "AO-2025-011",
+        "intitule": "Construction d'une école de 6 salles de classe",
+        "lieu": "Garoua",
+        "date": "2025-09-15",
+        "estimation": 85_000_000,
+        "cout": 68_000_000,
+        "offre": 79_500_000,
+        "bids": [("Alpha BTP", 81_000_000), ("Sahel Travaux", 76_800_000), ("Littoral Construction", 84_200_000)],
+    },
+    {
+        "reference": "AO-2025-017",
+        "intitule": "Réhabilitation d'un lycée technique",
+        "lieu": "Douala",
+        "date": "2025-11-04",
+        "estimation": 120_000_000,
+        "cout": 95_000_000,
+        "offre": 108_000_000,
+        "bids": [("Alpha BTP", 112_000_000), ("Littoral Construction", 110_500_000), ("Équatoriale Bâtiment", 115_000_000)],
+    },
+    {
+        "reference": "AO-2025-023",
+        "intitule": "Voirie et assainissement d'un quartier",
+        "lieu": "Yaoundé",
+        "date": "2026-01-22",
+        "estimation": 210_000_000,
+        "cout": 172_000_000,
+        "offre": 195_000_000,
+        "bids": [
+            ("Équatoriale Bâtiment", 189_000_000),
+            ("Alpha BTP", 198_000_000),
+            ("Sahel Travaux", 201_000_000),
+            ("Littoral Construction", 192_000_000),
+        ],
+    },
+    {
+        "reference": "AO-2026-004",
+        "intitule": "Magasin de stockage communal",
+        "lieu": "Bafoussam",
+        "date": "2026-04-10",
+        "estimation": 64_000_000,
+        "cout": 50_000_000,
+        "offre": 58_500_000,
+        "bids": [("Alpha BTP", 60_200_000), ("Sahel Travaux", 57_900_000)],
+    },
+    {
+        "reference": "AO-2026-009",
+        "intitule": "Centre de santé intégré",
+        "lieu": "Bertoua",
+        "date": "2026-06-18",
+        "estimation": 98_000_000,
+        "cout": 77_000_000,
+        "offre": 88_900_000,
+        "bids": [("Littoral Construction", 91_500_000), ("Équatoriale Bâtiment", 93_000_000), ("Alpha BTP", 89_400_000)],
+    },
+]
+DEMO_AO_OUVERTS = [
+    {
+        "reference": "AO-2026-015",
+        "intitule": "Construction de 24 logements sociaux",
+        "lieu": "Douala",
+        "date": "2026-11-20",
+        "estimation": 340_000_000,
+        "cout": 275_000_000,
+        "nb": 4,
+        "bids": [("Alpha BTP", 318_000_000)],
+    },
+    {
+        "reference": "AO-2026-018",
+        "intitule": "Adduction d'eau et château d'eau",
+        "lieu": "Maroua",
+        "date": "2026-12-05",
+        "estimation": 150_000_000,
+        "cout": 128_000_000,
+        "nb": 3,
+        "bids": [],
+    },
+    {
+        "reference": "AO-2026-021",
+        "intitule": "Extension d'un bâtiment administratif",
+        "lieu": "Yaoundé",
+        "date": "2026-11-30",
+        "estimation": 72_000_000,
+        "cout": 66_500_000,
+        "nb": 5,
+        "bids": [],
+    },
+]
+DEMO_PRIX_BASE = [
+    ("Ciment CPJ 42,5 (sac 50 kg)", "sac", 6300),
+    ("Fer à béton HA12 (barre 12 m)", "u", 8200),
+    ("Fer à béton HA8 (barre 12 m)", "u", 3900),
+    ("Sable de rivière", "m³", 12000),
+    ("Gravier 15/25", "m³", 25000),
+    ("Parpaing 15 cm", "u", 520),
+    ("Tube PVC Ø100 (6 m)", "u", 9500),
+    ("Peinture vinylique (seau 20 L)", "u", 38000),
+]
+DEMO_FOURNISSEURS = [("Quincaillerie Centrale", 1.00), ("Dépôt Matériaux Express", 0.97), ("Grossiste Littoral", 1.04)]
+DEMO_RELEVES = [("2026-08-12", 0.0), ("2026-09-14", 0.02), ("2026-10-10", 0.045)]
+
+
+def seed_marches_demo() -> tuple[int, int]:
+    """Insère des appels d'offres, offres concurrentes et prix d'exemple. Retourne (marchés, relevés de prix)."""
+    conn = get_connection()
+    n_ao = n_prix = 0
+    with _WRITE_LOCK:
+        try:
+            for ao in DEMO_AO_CLOS + DEMO_AO_OUVERTS:
+                if conn.execute("SELECT 1 FROM appels_offres WHERE reference = ?", (ao["reference"],)).fetchone():
+                    continue
+                cloture = "offre" in ao
+                if cloture:
+                    tous = list(ao["bids"]) + [("Innovation BTP", ao["offre"])]
+                    gagnant = min(tous, key=lambda x: x[1])[0]
+                    statut = "Gagné" if gagnant == "Innovation BTP" else "Perdu"
+                    offre, nb = ao["offre"], len(ao["bids"])
+                else:
+                    gagnant, statut, offre, nb = None, "À étudier", 0, ao["nb"]
+                cur = conn.execute(
+                    "INSERT INTO appels_offres (reference, intitule, maitre_ouvrage, localisation, date_limite, "
+                    "estimation, cout_estime, notre_offre, nb_concurrents, statut, attributaire, notes) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        ao["reference"], ao["intitule"], "Maître d'ouvrage (exemple)", ao["lieu"], ao["date"],
+                        ao["estimation"], ao["cout"], offre, nb, statut, gagnant,
+                        "Donnée d'exemple : à remplacer par vos vrais marchés.",
+                    ),
+                )
+                for entreprise, montant in ao["bids"]:
+                    conn.execute(
+                        "INSERT INTO concurrents_offres (appel_id, entreprise, montant) VALUES (?,?,?)",
+                        (cur.lastrowid, entreprise, montant),
+                    )
+                n_ao += 1
+            if conn.execute("SELECT COUNT(*) FROM prix_marche").fetchone()[0] == 0:
+                for idx, (mat, unite, base) in enumerate(DEMO_PRIX_BASE):
+                    amplitude = (1.5, 1.0, 0.3)[idx % 3]
+                    for fournisseur, coef in DEMO_FOURNISSEURS:
+                        for jour, derive in DEMO_RELEVES:
+                            prix = round(base * coef * (1 + derive * amplitude) / 50) * 50
+                            conn.execute(
+                                "INSERT INTO prix_marche (materiau, unite, fournisseur, prix, date) VALUES (?,?,?,?,?)",
+                                (mat, unite, fournisseur, max(prix, 50), jour),
+                            )
+                            n_prix += 1
+            conn.commit()
+        except sqlite3.Error as exc:
+            conn.rollback()
+            log.exception("Création des données d'exemple annulée")
+            st.error(f"Opération annulée : {exc}")
+            return 0, 0
+    return n_ao, n_prix
+
+
+# --------------------------------------------------------------------------- #
+# Marchés BTP : interface
+# --------------------------------------------------------------------------- #
+def tender_fields(prefix: str, row: pd.Series | None) -> dict:
+    """Champs d'un appel d'offres (à utiliser dans un st.form)."""
+
+    def val(key: str, default):
+        return row[key] if row is not None and pd.notna(row[key]) else default
+
+    reference = st.text_input("Référence *", value=str(val("reference", "")), key=f"{prefix}_ref")
+    intitule = st.text_input("Intitulé du marché *", value=str(val("intitule", "")), key=f"{prefix}_int")
+    col1, col2 = st.columns(2)
+    maitre = col1.text_input("Maître d'ouvrage", value=str(val("maitre_ouvrage", "")), key=f"{prefix}_mo")
+    lieu = col2.text_input("Localisation", value=str(val("localisation", "")), key=f"{prefix}_lieu")
+    col3, col4 = st.columns(2)
+    limite = col3.date_input(
+        "Date limite de dépôt",
+        value=to_date(row["date_limite"]) if row is not None else date.today(),
+        key=f"{prefix}_lim",
+    )
+    estimation = col4.number_input(
+        f"Estimation du maître d'ouvrage ({DEVISE})",
+        min_value=0.0,
+        step=1_000_000.0,
+        format="%.0f",
+        value=float(val("estimation", 0.0)),
+        key=f"{prefix}_est",
+    )
+    col5, col6, col7 = st.columns(3)
+    cout = col5.number_input(
+        f"Votre coût estimé ({DEVISE})",
+        min_value=0.0,
+        step=1_000_000.0,
+        format="%.0f",
+        value=float(val("cout_estime", 0.0)),
+        key=f"{prefix}_cout",
+    )
+    offre = col6.number_input(
+        f"Votre offre déposée ({DEVISE}, 0 si aucune)",
+        min_value=0.0,
+        step=1_000_000.0,
+        format="%.0f",
+        value=float(val("notre_offre", 0.0)),
+        key=f"{prefix}_offre",
+    )
+    nb = col7.number_input(
+        "Concurrents attendus", min_value=0, max_value=30, value=int(val("nb_concurrents", 4)), step=1, key=f"{prefix}_nb"
+    )
+    col8, col9 = st.columns(2)
+    statut_actuel = str(val("statut", "À étudier"))
+    statut = col8.selectbox(
+        "Statut",
+        STATUTS_AO,
+        index=STATUTS_AO.index(statut_actuel) if statut_actuel in STATUTS_AO else 0,
+        key=f"{prefix}_statut",
+    )
+    attributaire = col9.text_input("Entreprise attributaire (si connue)", value=str(val("attributaire", "")), key=f"{prefix}_attr")
+    notes = st.text_area("Notes", value=str(val("notes", "")), key=f"{prefix}_notes")
+    return {
+        "reference": reference.strip(),
+        "intitule": intitule.strip(),
+        "maitre_ouvrage": maitre.strip(),
+        "localisation": lieu.strip(),
+        "date_limite": limite.isoformat(),
+        "estimation": estimation,
+        "cout_estime": cout,
+        "notre_offre": offre,
+        "nb_concurrents": int(nb),
+        "statut": statut,
+        "attributaire": attributaire.strip(),
+        "notes": notes.strip(),
+    }
+
+
+def validate_tender(data: dict) -> bool:
+    if not data["reference"] or not data["intitule"]:
+        st.error("La référence et l'intitulé sont obligatoires.")
+        return False
+    return True
+
+
+def tab_marches_classement(model: dict, marge_min: float, plafond: float) -> None:
+    st.write(
+        "Pour chaque marché ouvert, l'application cherche le **prix qui maximise le gain espéré** "
+        "(probabilité de gagner × marge), puis classe les marchés du plus au moins intéressant."
+    )
+    st.caption(
+        "Hypothèse : le marché est attribué au moins-disant. Il s'agit d'une estimation statistique, "
+        "pas d'une garantie : elle s'améliore à mesure que vous enregistrez des offres concurrentes."
+    )
+    all_ao = query("SELECT statut, notre_offre FROM appels_offres")
+    if not all_ao.empty:
+        clos = all_ao[all_ao["statut"].isin(["Gagné", "Perdu"])]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Marchés suivis", len(all_ao))
+        c2.metric(
+            "Taux de réussite historique",
+            f"{(clos['statut'] == 'Gagné').mean():.0%}" if not clos.empty else "—",
+        )
+        c3.metric("Montant gagné", fcfa(clos.loc[clos["statut"] == "Gagné", "notre_offre"].sum() if not clos.empty else 0))
+
+    ranking, incomplets = rank_opportunities(model, marge_min, plafond)
+    if ranking.empty:
+        st.info(
+            "Aucun marché ouvert à analyser. Ajoutez un appel d'offres (statut « À étudier ») avec l'estimation "
+            "du maître d'ouvrage et votre coût estimé, ou chargez les données d'exemple."
+        )
+    else:
+        top = ranking.iloc[0]
+        if top["Gain espéré"] > 0:
+            st.success(
+                f"**Meilleure option : {top['Référence']} — {top['Intitulé']}.** Prix conseillé {fcfa(top['Prix conseillé'])}, "
+                f"probabilité de gain {top['Proba de gain']:.0f} %, marge {top['Marge %']:.1f} %, "
+                f"gain espéré {fcfa(top['Gain espéré'])}."
+            )
+        else:
+            st.warning("Aucun marché ouvert ne présente un gain espéré positif avec ces hypothèses.")
+        st.dataframe(
+            ranking,
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Estimation": st.column_config.NumberColumn(format="%d"),
+                "Coût estimé": st.column_config.NumberColumn(format="%d"),
+                "Prix conseillé": st.column_config.NumberColumn(format="%d"),
+                "Gain espéré": st.column_config.NumberColumn(format="%d"),
+                "Marge %": st.column_config.NumberColumn(format="%.1f"),
+                "Proba de gain": st.column_config.ProgressColumn("Proba de gain", min_value=0, max_value=100, format="%.0f%%"),
+                "Proba avec votre offre": st.column_config.NumberColumn(format="%.0f%%"),
+            },
+        )
+        st.bar_chart(ranking.set_index("Référence")["Gain espéré"])
+    if incomplets:
+        st.warning(
+            "Marchés non analysés (estimation ou coût estimé manquant) : " + ", ".join(incomplets) + "."
+        )
+
+
+def tab_marches_ao() -> None:
+    df = query(
+        "SELECT id, reference, intitule, maitre_ouvrage, localisation, date_limite, estimation, cout_estime, "
+        "notre_offre, nb_concurrents, statut, attributaire FROM appels_offres ORDER BY date_limite DESC"
+    )
+    if df.empty:
+        st.info("Aucun appel d'offres enregistré.")
+    else:
+        statuts = st.multiselect("Filtrer par statut", STATUTS_AO, key="ao_filtre")
+        shown = df[df["statut"].isin(statuts)] if statuts else df
+        st.dataframe(
+            shown,
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "estimation": st.column_config.NumberColumn("Estimation", format="%d"),
+                "cout_estime": st.column_config.NumberColumn("Coût estimé", format="%d"),
+                "notre_offre": st.column_config.NumberColumn("Notre offre", format="%d"),
+            },
+        )
+        st.caption(f"{len(shown)} appel(s) d'offres")
+
+    if not can_edit():
+        read_only_notice()
+        return
+
+    with st.expander("➕ Nouvel appel d'offres"):
+        with st.form("ao_add", clear_on_submit=True):
+            data = tender_fields("ao_add", None)
+            if st.form_submit_button("Enregistrer", type="primary") and validate_tender(data):
+                if db_write(
+                    "INSERT INTO appels_offres (reference, intitule, maitre_ouvrage, localisation, date_limite, "
+                    "estimation, cout_estime, notre_offre, nb_concurrents, statut, attributaire, notes) VALUES "
+                    "(:reference,:intitule,:maitre_ouvrage,:localisation,:date_limite,:estimation,:cout_estime,"
+                    ":notre_offre,:nb_concurrents,:statut,:attributaire,:notes)",
+                    data,
+                ) is not None:
+                    flash("Appel d'offres enregistré.")
+                    st.rerun()
+
+    if df.empty:
+        return
+    labels = {int(r["id"]): f"{r['reference']} — {r['intitule']}" for _, r in df.iterrows()}
+    tid = st.selectbox("Appel d'offres à modifier / compléter", list(labels), format_func=labels.get, key="ao_sel")
+    row = query("SELECT * FROM appels_offres WHERE id = ?", (tid,)).iloc[0]
+
+    with st.expander("✏️ Modifier cet appel d'offres"):
+        with st.form(f"ao_edit_{tid}"):
+            data = tender_fields(f"ao_edit_{tid}", row)
+            if st.form_submit_button("Mettre à jour", type="primary") and validate_tender(data):
+                data["id"] = tid
+                if db_write(
+                    "UPDATE appels_offres SET reference=:reference, intitule=:intitule, maitre_ouvrage=:maitre_ouvrage, "
+                    "localisation=:localisation, date_limite=:date_limite, estimation=:estimation, "
+                    "cout_estime=:cout_estime, notre_offre=:notre_offre, nb_concurrents=:nb_concurrents, "
+                    "statut=:statut, attributaire=:attributaire, notes=:notes WHERE id=:id",
+                    data,
+                ) is not None:
+                    flash("Appel d'offres mis à jour.")
+                    st.rerun()
+
+    st.write("**Offres des concurrents sur ce marché**")
+    bids = query(
+        "SELECT id, entreprise, montant FROM concurrents_offres WHERE appel_id = ? ORDER BY montant", (tid,)
+    )
+    if bids.empty:
+        st.caption("Aucune offre concurrente enregistrée.")
+    else:
+        shown_bids = bids.copy()
+        if float(row["estimation"]) > 0:
+            shown_bids["% de l'estimation"] = (shown_bids["montant"] / float(row["estimation"]) * 100).round(1)
+        st.dataframe(shown_bids, hide_index=True, use_container_width=True)
+    with st.form(f"bid_add_{tid}", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+        entreprise = col1.text_input("Entreprise concurrente *", key=f"bid_ent_{tid}")
+        montant = col2.number_input(
+            f"Montant de l'offre ({DEVISE}) *", min_value=0.0, step=1_000_000.0, format="%.0f", key=f"bid_mt_{tid}"
+        )
+        if st.form_submit_button("Ajouter l'offre concurrente"):
+            if not entreprise.strip() or montant <= 0:
+                st.error("Indiquez l'entreprise et un montant supérieur à zéro.")
+            elif db_write(
+                "INSERT INTO concurrents_offres (appel_id, entreprise, montant) VALUES (?,?,?)",
+                (tid, entreprise.strip(), montant),
+            ) is not None:
+                flash("Offre concurrente ajoutée.")
+                st.rerun()
+    if not bids.empty:
+        bid_labels = {int(r["id"]): f"{r['entreprise']} — {fcfa(r['montant'])}" for _, r in bids.iterrows()}
+        bid_id = st.selectbox("Offre à supprimer", list(bid_labels), format_func=bid_labels.get, key=f"bid_del_{tid}")
+        if st.button("Supprimer l'offre", key=f"bid_del_btn_{tid}"):
+            if db_write("DELETE FROM concurrents_offres WHERE id = ?", (bid_id,)) is not None:
+                flash("Offre supprimée.")
+                st.rerun()
+
+    if is_admin():
+        st.divider()
+        if confirm_delete(f"ao_{tid}") and st.button("Supprimer cet appel d'offres", key=f"del_ao_{tid}"):
+            if db_write("DELETE FROM appels_offres WHERE id = ?", (tid,)) is not None:
+                flash("Appel d'offres supprimé.")
+                st.rerun()
+
+
+def analyse_prix(prix: pd.DataFrame) -> pd.DataFrame:
+    """Synthèse par matériau : meilleur prix, moyenne, écart entre fournisseurs, tendance mensuelle."""
+    prix = prix.sort_values("date")
+    dernier = prix.groupby(["materiau", "fournisseur"]).tail(1)
+    rows = []
+    for mat, g in dernier.groupby("materiau"):
+        best = g.loc[g["prix"].idxmin()]
+        rows.append(
+            {
+                "Matériau": mat,
+                "Unité": g["unite"].iloc[0],
+                "Meilleur prix": float(best["prix"]),
+                "Fournisseur": best["fournisseur"],
+                "Prix moyen": float(g["prix"].mean()),
+                "Prix max": float(g["prix"].max()),
+                "Écart max/min %": (float(g["prix"].max()) / float(g["prix"].min()) - 1) * 100,
+                "Nb fournisseurs": len(g),
+            }
+        )
+    out = pd.DataFrame(rows)
+    mensuel = prix.assign(mois=prix["date"].str[:7]).groupby(["materiau", "mois"])["prix"].mean().reset_index()
+    tendance: dict[str, float] = {}
+    for mat, g in mensuel.groupby("materiau"):
+        g = g.sort_values("mois")
+        if len(g) >= 2:
+            tendance[mat] = (float(g["prix"].iloc[-1]) / float(g["prix"].iloc[-2]) - 1) * 100
+    out["Tendance mensuelle %"] = out["Matériau"].map(tendance)
+
+    def signal(t: float) -> str:
+        if pd.isna(t):
+            return "—"
+        if t > 3:
+            return "📈 Hausse : acheter / sécuriser"
+        if t < -3:
+            return "📉 Baisse : patienter"
+        return "➡️ Stable"
+
+    out["Signal"] = out["Tendance mensuelle %"].map(signal)
+    stock = query("SELECT nom, prix_unitaire FROM materiaux")
+    if not stock.empty:
+        stock_map = dict(zip(stock["nom"], stock["prix_unitaire"]))
+        out["Prix en stock"] = out["Matériau"].map(stock_map)
+        if out["Prix en stock"].notna().any():
+            out["Écart stock/marché %"] = (out["Prix en stock"] / out["Meilleur prix"] - 1) * 100
+        else:
+            out = out.drop(columns="Prix en stock")
+    return out.round(1)
+
+
+def tab_marches_prix() -> None:
+    prix = query("SELECT * FROM prix_marche ORDER BY date")
+    if prix.empty:
+        st.info("Aucun relevé de prix. Ajoutez des relevés ci-dessous ou chargez les données d'exemple.")
+    else:
+        synth = analyse_prix(prix)
+        st.subheader("Synthèse par matériau")
+        st.caption("Basée sur le dernier relevé de chaque fournisseur.")
+        st.dataframe(synth, hide_index=True, use_container_width=True)
+
+        mats = list(synth["Matériau"])
+        choix = st.selectbox("Évolution des prix du matériau", mats, key="prix_mat")
+        g = prix[prix["materiau"] == choix]
+        st.line_chart(g.pivot_table(index="date", columns="fournisseur", values="prix", aggfunc="mean"))
+
+        st.subheader("Estimateur du coût matériaux")
+        st.caption("Ajoutez des lignes (matériau + quantité) pour comparer l'achat au meilleur prix et au prix moyen.")
+        base = pd.DataFrame({"Matériau": mats[:1], "Quantité": [1.0]})
+        edited = st.data_editor(
+            base,
+            num_rows="dynamic",
+            hide_index=True,
+            use_container_width=True,
+            key="est_mat",
+            column_config={
+                "Matériau": st.column_config.SelectboxColumn("Matériau", options=mats, required=True),
+                "Quantité": st.column_config.NumberColumn("Quantité", min_value=0.0),
+            },
+        )
+        lignes = edited.dropna(subset=["Matériau"]).merge(
+            synth[["Matériau", "Unité", "Meilleur prix", "Prix moyen"]], on="Matériau", how="left"
+        )
+        if not lignes.empty:
+            lignes["Quantité"] = lignes["Quantité"].fillna(0)
+            lignes["Total meilleur prix"] = lignes["Quantité"] * lignes["Meilleur prix"]
+            lignes["Total prix moyen"] = lignes["Quantité"] * lignes["Prix moyen"]
+            st.dataframe(lignes, hide_index=True, use_container_width=True)
+            total_best, total_avg = float(lignes["Total meilleur prix"].sum()), float(lignes["Total prix moyen"].sum())
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Coût au meilleur prix", fcfa(total_best))
+            c2.metric("Coût au prix moyen", fcfa(total_avg))
+            c3.metric("Économie possible", fcfa(total_avg - total_best))
+
+    if not can_edit():
+        read_only_notice()
+        return
+    with st.expander("➕ Ajouter un relevé de prix"):
+        with st.form("prix_add", clear_on_submit=True):
+            col1, col2 = st.columns(2)
+            materiau = col1.text_input("Matériau *", key="prix_add_mat")
+            unite = col2.selectbox("Unité", UNITES, key="prix_add_unite")
+            col3, col4, col5 = st.columns(3)
+            fournisseur = col3.text_input("Fournisseur *", key="prix_add_four")
+            valeur = col4.number_input(f"Prix unitaire ({DEVISE}) *", min_value=0.0, step=50.0, format="%.0f", key="prix_add_val")
+            jour = col5.date_input("Date du relevé", value=date.today(), key="prix_add_date")
+            if st.form_submit_button("Enregistrer le relevé", type="primary"):
+                if not materiau.strip() or not fournisseur.strip() or valeur <= 0:
+                    st.error("Matériau, fournisseur et un prix supérieur à zéro sont obligatoires.")
+                elif db_write(
+                    "INSERT INTO prix_marche (materiau, unite, fournisseur, prix, date) VALUES (?,?,?,?,?)",
+                    (materiau.strip(), unite, fournisseur.strip(), valeur, jour.isoformat()),
+                ) is not None:
+                    flash("Relevé enregistré.")
+                    st.rerun()
+    if is_admin() and not prix.empty:
+        with st.expander("🗑️ Supprimer un relevé"):
+            recents = prix.sort_values("date", ascending=False).head(50)
+            labels = {
+                int(r["id"]): f"{r['date']} · {r['materiau']} · {r['fournisseur']} · {fcfa(r['prix'])}"
+                for _, r in recents.iterrows()
+            }
+            pid = st.selectbox("Relevé (50 plus récents)", list(labels), format_func=labels.get, key="prix_del_sel")
+            if st.button("Supprimer le relevé", key="prix_del_btn"):
+                if db_write("DELETE FROM prix_marche WHERE id = ?", (pid,)) is not None:
+                    flash("Relevé supprimé.")
+                    st.rerun()
+
+
+def tab_marches_concurrence(model: dict) -> None:
+    df = query(
+        "SELECT c.entreprise, c.montant, a.estimation, a.attributaire FROM concurrents_offres c "
+        "JOIN appels_offres a ON a.id = c.appel_id WHERE a.estimation > 0"
+    )
+    if df.empty:
+        st.info("Aucune offre concurrente enregistrée. Ajoutez-en dans l'onglet « Appels d'offres ».")
+        return
+    df["ratio"] = df["montant"] / df["estimation"] * 100
+    df["gagne"] = (
+        df["attributaire"].fillna("").str.strip().str.lower() == df["entreprise"].str.strip().str.lower()
+    )
+    stats = (
+        df.groupby("entreprise")
+        .agg(offres=("montant", "count"), ratio_moyen=("ratio", "mean"), ratio_min=("ratio", "min"), victoires=("gagne", "sum"))
+        .reset_index()
+    )
+    stats["taux_victoire"] = stats["victoires"] / stats["offres"] * 100
+    global_mean = float(df["ratio"].mean())
+
+    def profil(r: float) -> str:
+        if r < global_mean - 2:
+            return "💣 Agressif (prix bas)"
+        if r > global_mean + 2:
+            return "🛡️ Prudent (prix élevés)"
+        return "⚖️ Dans la moyenne"
+
+    stats["Profil"] = stats["ratio_moyen"].map(profil)
+    stats = stats.rename(
+        columns={
+            "entreprise": "Entreprise",
+            "offres": "Offres",
+            "ratio_moyen": "Offre moyenne (% estimation)",
+            "ratio_min": "Offre la plus basse (%)",
+            "victoires": "Victoires",
+            "taux_victoire": "Taux de victoire %",
+        }
+    ).sort_values("Offre moyenne (% estimation)")
+    st.dataframe(stats.round(1), hide_index=True, use_container_width=True)
+    st.bar_chart(stats.set_index("Entreprise")["Offre moyenne (% estimation)"])
+    st.caption(
+        f"Offre concurrente moyenne retenue par le modèle : {model['mu']:.1%} de l'estimation "
+        f"(écart-type {model['sigma']:.1%}) sur {model['n']} offre(s)."
+    )
+
+
+def tab_marches_simulateur(model: dict, marge_min: float, plafond: float) -> None:
+    tenders = query("SELECT * FROM appels_offres ORDER BY date_limite DESC")
+    if tenders.empty:
+        st.info("Ajoutez d'abord un appel d'offres.")
+        return
+    labels = {int(r["id"]): f"{r['reference']} — {r['intitule']}" for _, r in tenders.iterrows()}
+    tid = st.selectbox("Marché à simuler", list(labels), format_func=labels.get, key="sim_tid")
+    t = tenders[tenders["id"] == tid].iloc[0]
+    known = [float(x) for x in query("SELECT montant FROM concurrents_offres WHERE appel_id = ?", (tid,))["montant"]]
+    estimation, cout = float(t["estimation"]), float(t["cout_estime"])
+    if estimation <= 0 or cout <= 0:
+        st.warning("Renseignez l'estimation du maître d'ouvrage et votre coût estimé dans l'onglet « Appels d'offres ».")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    n_total = int(c1.number_input("Concurrents attendus", 0, 30, int(t["nb_concurrents"]), key=f"sim_n_{tid}"))
+    var_mat = c2.slider("Variation du prix des matériaux (%)", -20, 30, 0, key=f"sim_var_{tid}")
+    part_mat = c3.slider("Part des matériaux dans votre coût (%)", 0, 90, 55, key=f"sim_part_{tid}")
+    cout_adj = cout * (1 + part_mat / 100 * var_mat / 100)
+    n_unknown = max(n_total - len(known), 0)
+    st.caption(
+        f"Coût ajusté : {fcfa(cout_adj)} · {len(known)} offre(s) concurrente(s) connue(s) · "
+        f"{n_unknown} concurrent(s) encore inconnu(s)."
+    )
+
+    best = optimise_price(estimation, cout_adj, model, n_unknown, known, marge_min, plafond)
+    if best is None:
+        st.error(
+            "Marché non rentable : votre coût (avec la marge minimale) dépasse le plafond autorisé. "
+            "Réduisez le coût, ou relevez le plafond dans les hypothèses."
+        )
+    else:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Prix conseillé", fcfa(best["prix"]))
+        m2.metric("Probabilité de gain", f"{best['proba']:.0%}")
+        m3.metric("Marge", f"{best['marge_pct']:.1f} %")
+        m4.metric("Gain espéré", fcfa(best["esperance"]))
+        st.write(f"**Verdict : {verdict(best)}**")
+        if known and best["proba"] == 0:
+            st.warning("Un concurrent est déjà sous votre prix plancher : ce marché est très difficile à gagner.")
+
+    prix_test = st.number_input(
+        f"Tester un prix ({DEVISE})",
+        min_value=0.0,
+        step=500_000.0,
+        format="%.0f",
+        value=float(round(best["prix"])) if best else float(round(estimation)),
+        key=f"sim_test_{tid}",
+    )
+    if prix_test > 0:
+        pw = win_probability(prix_test, estimation, model, n_unknown, known)
+        st.write(
+            f"À {fcfa(prix_test)} : probabilité de gain **{pw:.0%}**, marge **{(prix_test - cout_adj) / cout_adj:.1%}**, "
+            f"gain espéré **{fcfa(pw * (prix_test - cout_adj))}**."
+        )
+
+    bas = estimation * 0.6
+    haut = max(estimation * plafond / 100, bas * 1.01)
+    courbe = evaluate_prices(np.linspace(bas, haut, 80), estimation, cout_adj, model, n_unknown, known)
+    courbe["Prix (M FCFA)"] = (courbe["prix"] / 1_000_000).round(1)
+    courbe = courbe.set_index("Prix (M FCFA)")
+    st.write("**Probabilité de gain selon le prix proposé (%)**")
+    st.line_chart((courbe["proba"] * 100).rename("Probabilité de gain (%)"))
+    st.write("**Gain espéré selon le prix proposé (FCFA)**")
+    st.line_chart(courbe["esperance"].rename("Gain espéré"))
+
+
+def page_marches() -> None:
+    st.header("📈 Analyse des marchés BTP")
+    st.caption("Prix des marchés, prix des matériaux et concurrence : probabilité de gain et meilleures options.")
+
+    with st.expander("⚙️ Hypothèses du modèle"):
+        c1, c2, c3, c4 = st.columns(4)
+        marge_min = c1.number_input("Marge minimale visée (%)", 0.0, 50.0, 8.0, 0.5, key="mk_marge")
+        plafond = c2.number_input("Plafond (% de l'estimation)", 50.0, 130.0, 100.0, 1.0, key="mk_plafond")
+        prior_mu = c3.number_input("Offre concurrente typique (% estimation)", 50.0, 130.0, 92.0, 1.0, key="mk_mu") / 100
+        prior_sigma = c4.number_input("Dispersion des offres (points %)", 1.0, 30.0, 7.0, 0.5, key="mk_sigma") / 100
+        st.caption(
+            "Ces valeurs servent de point de départ ; elles sont corrigées automatiquement par les offres "
+            "concurrentes que vous enregistrez."
+        )
+    model = competitor_model(prior_mu, prior_sigma)
+    st.caption(
+        f"Modèle de concurrence : offre concurrente moyenne ≈ {model['mu']:.1%} de l'estimation "
+        f"(± {model['sigma']:.1%}), d'après {model['n']} offre(s) enregistrée(s)."
+    )
+
+    tab_rank, tab_ao, tab_prix, tab_conc, tab_sim, tab_demo = st.tabs(
+        ["🎯 Meilleures options", "📋 Appels d'offres", "🧱 Prix des matériaux", "🏢 Concurrence", "🎲 Simulateur", "Données d'exemple"]
+    )
+    with tab_rank:
+        tab_marches_classement(model, marge_min, plafond)
+    with tab_ao:
+        tab_marches_ao()
+    with tab_prix:
+        tab_marches_prix()
+    with tab_conc:
+        tab_marches_concurrence(model)
+    with tab_sim:
+        tab_marches_simulateur(model, marge_min, plafond)
+    with tab_demo:
+        st.write(
+            "Charge 5 marchés clôturés (avec les offres des concurrents), 3 marchés ouverts à étudier et "
+            "des relevés de prix de 8 matériaux chez 3 fournisseurs."
+        )
+        st.caption("Valeurs fictives et indicatives : remplacez-les par vos relevés réels.")
+        if not can_edit():
+            read_only_notice()
+        elif st.button("Charger les données d'exemple", type="primary", key="seed_mk"):
+            n_ao, n_prix = seed_marches_demo()
+            if n_ao or n_prix:
+                flash(f"{n_ao} marché(s) et {n_prix} relevé(s) de prix ajoutés.")
+                st.rerun()
+            else:
+                st.info("Les données d'exemple existent déjà.")
 
 
 # --------------------------------------------------------------------------- #
@@ -1161,6 +2377,14 @@ def page_rapports() -> None:
         "Pointages": "SELECT * FROM pointages",
         "Devis": "SELECT * FROM devis",
         "Lignes_devis": "SELECT * FROM devis_lignes",
+        "Intervenants": (
+            "SELECT ch.nom AS chantier, e.nom AS employe, a.fonction, e.telephone, e.taux_journalier "
+            "FROM affectations a JOIN chantiers ch ON ch.id = a.chantier_id "
+            "JOIN employes e ON e.id = a.employe_id ORDER BY ch.nom, a.fonction, e.nom"
+        ),
+        "Appels_offres": "SELECT * FROM appels_offres",
+        "Offres_concurrents": "SELECT * FROM concurrents_offres",
+        "Prix_marche": "SELECT * FROM prix_marche",
     }
     if st.button("Préparer le classeur Excel complet"):
         sheets = {"Synthese": synthese} if not synthese.empty else {}
@@ -1276,8 +2500,10 @@ def page_parametres() -> None:
 PAGES = {
     "📊 Tableau de bord": page_dashboard,
     "🏗️ Chantiers": page_chantiers,
+    "🧑‍🔧 Intervenants": page_intervenants,
     "👥 Clients": page_clients,
     "🧾 Devis": page_devis,
+    "📈 Marchés BTP": page_marches,
     "📦 Stock": page_stock,
     "👷 Personnel": page_personnel,
     "💸 Dépenses": page_depenses,
@@ -1316,3 +2542,4 @@ def main() -> None:
 
 
 main()
+
