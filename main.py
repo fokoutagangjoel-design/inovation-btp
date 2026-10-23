@@ -10,6 +10,8 @@ Points clés de cette version :
   stock, personnel, dépenses, rapports/exports, paramètres.
 
 NOUVEAUTÉS
+* Page d'accueil animée : bâtiments, grue, camions de location et symboles de probabilité ;
+  au premier lancement, 4 chantiers « En cours » sont créés avec leurs équipes complètes.
 * « Intervenants » : fiche par chantier (ingénieur, technicien, manœuvres, plombiers,
   ferrailleurs, contrôleurs techniques) avec n°, nom, téléphone, taux journalier.
 * « Marchés BTP » : appels d'offres, prix des matériaux, offres des concurrents,
@@ -21,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import html
 import io
 import logging
 import math
@@ -35,6 +38,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 # --------------------------------------------------------------------------- #
 # Configuration générale
@@ -62,12 +66,14 @@ HEURES_PAR_JOUR = 8
 
 # --- Intervenants de chantier ---
 FONCTIONS_CHANTIER = [
+    "Maître d'ouvrage",
     "Ingénieur",
     "Technicien",
-    "Manœuvre",
-    "Plombier",
-    "Ferrailleur",
     "Contrôleur technique",
+    "Coffreur",
+    "Ferrailleur",
+    "Plombier",
+    "Manœuvre",
 ]
 
 # --- Marchés BTP ---
@@ -199,6 +205,10 @@ CREATE TABLE IF NOT EXISTS prix_marche (
     fournisseur TEXT NOT NULL,
     prix REAL NOT NULL CHECK (prix > 0),
     date TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
 );
 """
 
@@ -389,35 +399,38 @@ def excel_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
 # Authentification
 # --------------------------------------------------------------------------- #
 def login_page() -> None:
-    st.title(f"🏗️ {APP_TITLE}")
-    st.caption("Connectez-vous pour accéder à la gestion de vos chantiers.")
-    attempts = st.session_state.get("login_attempts", 0)
-    if attempts >= 5:
-        st.error("Trop de tentatives échouées. Rechargez la page pour réessayer.")
-        return
-    with st.form("login_form"):
-        username = st.text_input("Nom d'utilisateur")
-        password = st.text_input("Mot de passe", type="password")
-        submitted = st.form_submit_button("Se connecter", type="primary")
-    if submitted:
-        df = query("SELECT * FROM users WHERE username = ?", (username.strip(),))
-        if not df.empty:
-            row = df.iloc[0]
-            if verify_password(password, row["password_hash"], row["salt"]):
-                st.session_state["user"] = {
-                    "id": int(row["id"]),
-                    "username": row["username"],
-                    "role": row["role"],
-                }
-                st.session_state["login_attempts"] = 0
-                st.rerun()
-        st.session_state["login_attempts"] = attempts + 1
-        st.error("Identifiants incorrects.")
-    if default_admin_password() == "ChangeMe123":
-        st.warning(
-            "Première utilisation : compte « admin » / mot de passe « ChangeMe123 ». "
-            "Changez-le dans Paramètres dès la connexion."
-        )
+    render_hero()
+    _, centre, _ = st.columns([1, 1.6, 1])
+    with centre:
+        st.subheader("Connexion")
+        st.caption("Connectez-vous pour accéder à la gestion de vos chantiers et à l'analyse des marchés BTP.")
+        attempts = st.session_state.get("login_attempts", 0)
+        if attempts >= 5:
+            st.error("Trop de tentatives échouées. Rechargez la page pour réessayer.")
+            return
+        with st.form("login_form"):
+            username = st.text_input("Nom d'utilisateur")
+            password = st.text_input("Mot de passe", type="password")
+            submitted = st.form_submit_button("Se connecter", type="primary")
+        if submitted:
+            df = query("SELECT * FROM users WHERE username = ?", (username.strip(),))
+            if not df.empty:
+                row = df.iloc[0]
+                if verify_password(password, row["password_hash"], row["salt"]):
+                    st.session_state["user"] = {
+                        "id": int(row["id"]),
+                        "username": row["username"],
+                        "role": row["role"],
+                    }
+                    st.session_state["login_attempts"] = 0
+                    st.rerun()
+            st.session_state["login_attempts"] = attempts + 1
+            st.error("Identifiants incorrects.")
+        if default_admin_password() == "ChangeMe123":
+            st.warning(
+                "Première utilisation : compte « admin » / mot de passe « ChangeMe123 ». "
+                "Changez-le dans Paramètres dès la connexion."
+            )
 
 
 def logout() -> None:
@@ -427,10 +440,229 @@ def logout() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Scène d'accueil animée (bâtiments, grue, camions de location, probabilités)
+# --------------------------------------------------------------------------- #
+HERO_CSS = """
+html,body{margin:0;padding:0;background:transparent;overflow:hidden}
+.wrap{border-radius:14px;overflow:hidden;box-shadow:0 2px 14px rgba(0,0,0,.28)}
+svg{display:block;width:100%;height:380px;font-family:Arial,Helvetica,sans-serif}
+@keyframes driveR{from{transform:translateX(-240px)}to{transform:translateX(1340px)}}
+@keyframes driveL{from{transform:translateX(1340px)}to{transform:translateX(-240px)}}
+@keyframes cloud{from{transform:translateX(-200px)}to{transform:translateX(1400px)}}
+@keyframes floaty{0%,100%{transform:translateY(0)}50%{transform:translateY(-7px)}}
+@keyframes swing{from{transform:scaleX(1)}to{transform:scaleX(-.55)}}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.25}}
+@keyframes road{to{stroke-dashoffset:-60}}
+@keyframes grow{from{transform:scaleY(.1)}to{transform:scaleY(1)}}
+@keyframes gauge{from{stroke-dashoffset:170}to{stroke-dashoffset:var(--off)}}
+.t1{animation:driveR 17s linear infinite}
+.t2{animation:driveL 23s linear infinite;animation-delay:-9s}
+.t3{animation:driveR 29s linear infinite;animation-delay:-21s}
+.cloud{animation:cloud 60s linear infinite}
+.float{animation:floaty 4.5s ease-in-out infinite}
+.jib{animation:swing 9s ease-in-out infinite alternate}
+.win{animation:blink 5s ease-in-out infinite}
+.road{stroke-dasharray:30 30;animation:road 1.2s linear infinite}
+.bar{transform-box:fill-box;transform-origin:bottom;animation:grow 2.4s ease-out infinite alternate}
+.gauge{stroke-dasharray:170;animation:gauge 2.6s ease-out forwards}
+@media (prefers-reduced-motion:reduce){*{animation:none!important}.gauge{stroke-dashoffset:var(--off)}}
+"""
+
+
+def _truck_svg(body: str, cab: str, label: str, direction: int, cls: str, y: int) -> str:
+    """Camion de location (benne fermée). direction = 1 vers la droite, -1 vers la gauche."""
+    flip = 'transform="translate(130,0) scale(-1,1)"' if direction < 0 else ""
+    text_x = 85 if direction < 0 else 45
+    wheels = "".join(
+        f'<circle cx="{cx}" cy="-4" r="10" fill="#1d2025"/><circle cx="{cx}" cy="-4" r="4" fill="#9aa3ad"/>'
+        for cx in (22, 62, 112)
+    )
+    return (
+        f'<g class="{cls}"><g transform="translate(0,{y})">'
+        f'<g {flip}>'
+        f'<rect x="0" y="-52" width="92" height="44" rx="4" fill="{body}"/>'
+        f'<rect x="0" y="-18" width="92" height="5" fill="rgba(0,0,0,.18)"/>'
+        f'<rect x="94" y="-40" width="36" height="32" rx="5" fill="{cab}"/>'
+        f'<path d="M101 -37 h17 l8 14 h-25z" fill="#cfeaff"/>'
+        f'<rect x="0" y="-12" width="130" height="6" rx="2" fill="#2b2f36"/>'
+        f"{wheels}</g>"
+        f'<text x="{text_x}" y="-30" text-anchor="middle" font-size="13" font-weight="700" fill="#fff">{label}</text>'
+        f'<text x="{text_x}" y="-21" text-anchor="middle" font-size="7" fill="#fff" opacity=".85">engins &amp; matériel</text>'
+        f"</g></g>"
+    )
+
+
+def hero_html(chantiers: list[tuple[str, int]] | None = None, proba: float | None = None) -> str:
+    """Page HTML autonome : ville en construction, grue, camions de location et symboles de probabilité.
+
+    ``chantiers`` : liste (nom, avancement %) ; chaque chantier devient un bâtiment dont la hauteur
+    suit l'avancement. ``proba`` : meilleure probabilité de gain (0-100) pour la jauge, sinon symbole seul.
+    """
+    items = [(str(n), max(0, min(100, int(a)))) for n, a in (chantiers or [])][:6]
+    if not items:
+        items = [("Immeuble R+3", 45), ("Villa duplex", 60), ("Pont de desserte", 30), ("Entrepôt", 70)]
+    n = len(items)
+    zone_x, zone_w, ground = 30, 840, 300
+    slot = zone_w / n
+    bw = min(120.0, slot - 26)
+    palette = ["#5b7fa6", "#7a8fb5", "#6c9a8b", "#a58b6f", "#8a7ca8", "#6f98a5"]
+    crane_idx = min(range(n), key=lambda i: items[i][1])
+    parts: list[str] = []
+    crane = ""
+
+    for i, (nom, av) in enumerate(items):
+        x = zone_x + i * slot + (slot - bw) / 2
+        h = 60 + 1.4 * av
+        top = ground - h
+        if av < 100:
+            parts.append(
+                f'<rect x="{x:.1f}" y="{ground - 200}" width="{bw:.1f}" height="200" fill="none" '
+                f'stroke="#ffffff" stroke-opacity=".55" stroke-dasharray="6 5" rx="3"/>'
+            )
+        parts.append(f'<rect x="{x:.1f}" y="{top:.1f}" width="{bw:.1f}" height="{h:.1f}" fill="{palette[i % 6]}" rx="3"/>')
+        parts.append(f'<rect x="{x - 3:.1f}" y="{top - 5:.1f}" width="{bw + 6:.1f}" height="7" fill="#2f3b4a" rx="2"/>')
+        floors = int((h - 14) // 24)
+        cols = max(int((bw - 12) // 24), 2)
+        spacing = (bw - 20) / cols
+        for r in range(floors):
+            for c in range(cols):
+                wx = x + 10 + c * spacing + (spacing - 12) / 2
+                wy = top + 12 + r * 24
+                if wy + 14 > ground - 4:
+                    continue
+                off = (r + c + i) % 4 == 0
+                delay = ((i * 7 + r * 3 + c * 5) % 9) * 0.45
+                fill = "#26303b" if off else "#ffe38a"
+                cls = "" if off else ' class="win"'
+                parts.append(
+                    f'<rect{cls} x="{wx:.1f}" y="{wy:.1f}" width="12" height="14" rx="1.5" fill="{fill}" '
+                    f'style="animation-delay:{delay:.2f}s"/>'
+                )
+        label = nom if len(nom) <= 26 else nom[:25] + "…"
+        parts.append(
+            f'<text x="{x + bw / 2:.1f}" y="{top - 12:.1f}" text-anchor="middle" font-size="10.5" font-weight="700" '
+            f'fill="#fff" stroke="#14202e" stroke-width="3" paint-order="stroke">{html.escape(label)} · {av}%</text>'
+        )
+        if i == crane_idx:
+            tx = x + bw + 9
+            crane = (
+                f'<rect x="{tx - 3:.1f}" y="84" width="6" height="{ground - 84}" fill="#e8b923"/>'
+                f'<rect x="{tx - 3:.1f}" y="84" width="6" height="{ground - 84}" fill="none" stroke="#7a5b00" '
+                f'stroke-dasharray="3 4"/>'
+                f'<g class="jib" style="transform-origin:{tx:.1f}px 84px">'
+                f'<rect x="{tx - 82:.1f}" y="79" width="180" height="5" fill="#e8b923"/>'
+                f'<rect x="{tx - 94:.1f}" y="75" width="15" height="15" fill="#4a4f57"/>'
+                f'<line x1="{tx + 74:.1f}" y1="84" x2="{tx + 74:.1f}" y2="138" stroke="#222" stroke-width="1.5"/>'
+                f'<rect x="{tx + 67:.1f}" y="138" width="14" height="10" rx="2" fill="#e8b923"/></g>'
+            )
+
+    skyline = "".join(
+        f'<rect x="{sx}" y="{ground - sh}" width="{sw}" height="{sh}" fill="#ffffff" fill-opacity=".16"/>'
+        for sx, sw, sh in [(0, 60, 90), (70, 40, 130), (120, 70, 100), (210, 50, 150), (880, 60, 110),
+                           (950, 50, 140), (1010, 70, 95), (1090, 55, 125), (1150, 60, 105)]
+    )
+    best = f"{proba:.0f}%" if proba is not None else "%"
+    gauge_off = 170 * (1 - (proba / 100 if proba is not None else 0.72))
+    trucks = (
+        _truck_svg("#1f6fd1", "#174f98", "LOCATION", 1, "t1", 330)
+        + _truck_svg("#f08a24", "#c26a14", "LOCATION BTP", -1, "t2", 352)
+        + _truck_svg("#2e9e6b", "#217350", "LOCATION", 1, "t3", 352)
+    )
+    bars = "".join(
+        f'<rect class="bar" x="{1062 + k * 21}" y="{104 - bh}" width="14" height="{bh}" rx="2" fill="#2a7de1" '
+        f'style="animation-delay:{k * 0.25:.2f}s"/>'
+        for k, bh in enumerate([22, 38, 30, 50, 64])
+    )
+    cards = f"""
+<g class="float"><rect x="890" y="26" width="140" height="94" rx="12" fill="#fff" fill-opacity=".93"/>
+  <path d="M904 100 C922 100 934 46 960 46 S998 100 1016 100 Z" fill="#cfe3fb" stroke="#2a7de1" stroke-width="2"/>
+  <path d="M968 100 L968 52 C986 56 1000 100 1016 100 Z" fill="#2a7de1" fill-opacity=".55"/>
+  <line x1="968" y1="46" x2="968" y2="100" stroke="#c0392b" stroke-width="1.5" stroke-dasharray="3 3"/>
+  <text x="960" y="114" text-anchor="middle" font-size="9.5" font-weight="700" fill="#27415f">μ ± σ · prix des concurrents</text></g>
+<g class="float" style="animation-delay:-1.2s"><rect x="1044" y="26" width="140" height="94" rx="12" fill="#fff" fill-opacity=".93"/>
+  {bars}<line x1="1056" y1="104" x2="1176" y2="104" stroke="#8aa0b8"/>
+  <text x="1114" y="42" text-anchor="middle" font-size="10" font-weight="700" fill="#27415f">Gain espéré</text></g>
+<g class="float" style="animation-delay:-2.1s"><rect x="890" y="134" width="96" height="104" rx="12" fill="#fff" fill-opacity=".93"/>
+  <circle cx="938" cy="180" r="27" fill="none" stroke="#dbe5f1" stroke-width="9"/>
+  <circle class="gauge" cx="938" cy="180" r="27" fill="none" stroke="#2e9e6b" stroke-width="9" stroke-linecap="round"
+          transform="rotate(-90 938 180)" style="--off:{gauge_off:.1f}"/>
+  <text x="938" y="185" text-anchor="middle" font-size="14" font-weight="800" fill="#1d3b2c">{best}</text>
+  <text x="938" y="226" text-anchor="middle" font-size="9.5" font-weight="700" fill="#27415f">Proba. de gain</text></g>
+<g class="float" style="animation-delay:-3s"><rect x="1000" y="134" width="184" height="104" rx="12" fill="#fff" fill-opacity=".93"/>
+  <g transform="rotate(-12 1034 176)"><rect x="1016" y="156" width="36" height="36" rx="7" fill="#fff" stroke="#27415f" stroke-width="2"/>
+    <circle cx="1026" cy="166" r="3" fill="#27415f"/><circle cx="1042" cy="166" r="3" fill="#27415f"/>
+    <circle cx="1034" cy="174" r="3" fill="#27415f"/><circle cx="1026" cy="182" r="3" fill="#27415f"/><circle cx="1042" cy="182" r="3" fill="#27415f"/></g>
+  <g transform="rotate(14 1078 180)"><rect x="1062" y="164" width="32" height="32" rx="7" fill="#fff" stroke="#27415f" stroke-width="2"/>
+    <circle cx="1071" cy="173" r="3" fill="#27415f"/><circle cx="1085" cy="187" r="3" fill="#27415f"/></g>
+  <polyline points="1108,206 1126,196 1140,200 1156,182 1172,170" fill="none" stroke="#2e9e6b" stroke-width="3" stroke-linecap="round"/>
+  <polygon points="1176,166 1164,168 1172,178" fill="#2e9e6b"/>
+  <text x="1092" y="228" text-anchor="middle" font-size="9.5" font-weight="700" fill="#27415f">Risque · Marge · Concurrence</text></g>
+"""
+    svg = f"""
+<svg viewBox="0 0 1200 360" preserveAspectRatio="xMidYMax slice" role="img"
+     aria-label="Chantiers en construction, camions de location et analyse de probabilité">
+<defs><linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0" stop-color="#1f4e79"/><stop offset=".6" stop-color="#4f93cf"/><stop offset="1" stop-color="#f6d9a8"/></linearGradient></defs>
+<rect width="1200" height="360" fill="url(#sky)"/>
+<circle cx="760" cy="70" r="26" fill="#fff3b0" opacity=".95"/><circle cx="760" cy="70" r="44" fill="#fff3b0" opacity=".18"/>
+<g class="cloud"><ellipse cx="0" cy="120" rx="46" ry="14" fill="#fff" opacity=".55"/><ellipse cx="26" cy="112" rx="30" ry="12" fill="#fff" opacity=".55"/></g>
+<g class="cloud" style="animation-delay:-30s"><ellipse cx="0" cy="170" rx="38" ry="11" fill="#fff" opacity=".45"/></g>
+{skyline}
+<rect y="{ground}" width="1200" height="60" fill="#3a3f47"/><rect y="{ground}" width="1200" height="10" fill="#9aa0a6"/>
+<line class="road" x1="0" y1="343" x2="1200" y2="343" stroke="#f2f2f2" stroke-width="2"/>
+{"".join(parts)}
+{crane}
+{cards}
+<text x="40" y="50" font-size="31" font-weight="800" fill="#fff" stroke="#14202e" stroke-opacity=".35" stroke-width="3" paint-order="stroke">INNOVATION BTP</text>
+<text x="40" y="74" font-size="14" fill="#fff" stroke="#14202e" stroke-opacity=".35" stroke-width="2.5" paint-order="stroke">Chantiers · Marchés · Analyse de probabilité · Location d'engins</text>
+{trucks}
+</svg>"""
+    return (
+        '<!doctype html><html><head><meta charset="utf-8">'
+        f"<style>{HERO_CSS}</style></head><body><div class=\"wrap\">{svg}</div></body></html>"
+    )
+
+
+def render_hero(chantiers: list[tuple[str, int]] | None = None, proba: float | None = None) -> None:
+    components.html(hero_html(chantiers, proba), height=384)
+
+
+def ensure_demo_data() -> None:
+    """Au tout premier lancement : crée les 4 chantiers « En cours » avec leurs équipes (une seule fois)."""
+    if st.session_state.get("_demo_checked"):
+        return
+    st.session_state["_demo_checked"] = True
+    conn = get_connection()
+    if conn.execute("SELECT 1 FROM meta WHERE key = 'equipes_demo_v2'").fetchone():
+        return
+    nb = conn.execute("SELECT COUNT(*) FROM chantiers").fetchone()[0]
+    nb_demo = conn.execute("SELECT COUNT(*) FROM chantiers WHERE nom LIKE '%(démo)%'").fetchone()[0]
+    if nb == 0 or nb_demo > 0:  # base vide, ou chantiers d'exemple déjà présents à compléter
+        seed_intervenants_demo()
+    db_write("INSERT OR REPLACE INTO meta (key, value) VALUES ('equipes_demo_v2', '1')")
+
+
+def hero_data() -> tuple[list[tuple[str, int]], float | None]:
+    """Chantiers en cours (nom, avancement) et meilleure probabilité de gain, pour la scène du tableau de bord."""
+    df = query("SELECT nom, avancement FROM chantiers WHERE statut = 'En cours' ORDER BY id LIMIT 6")
+    items = [(str(r["nom"]).replace(" (démo)", ""), int(r["avancement"])) for _, r in df.iterrows()]
+    proba = None
+    try:
+        ranking, _ = rank_opportunities(competitor_model(0.92, 0.07), 8.0, 100.0)
+        if not ranking.empty and float(ranking.iloc[0]["Gain espéré"]) > 0:
+            proba = float(ranking.iloc[0]["Proba de gain"])
+    except Exception:  # noqa: BLE001 - la scène ne doit jamais bloquer la page
+        log.exception("Calcul de la probabilité pour la scène")
+    return items, proba
+
+
+# --------------------------------------------------------------------------- #
 # Tableau de bord
 # --------------------------------------------------------------------------- #
 def page_dashboard() -> None:
     st.header("📊 Tableau de bord")
+    scene_chantiers, scene_proba = hero_data()
+    render_hero(scene_chantiers, scene_proba)
     chantiers = query("SELECT * FROM chantiers")
     depenses = query("SELECT * FROM depenses")
 
@@ -796,20 +1028,24 @@ def show_chantier_detail(cid: int) -> None:
 # Intervenants des chantiers (ingénieur, technicien, manœuvres, plombiers…)
 # --------------------------------------------------------------------------- #
 EQUIPE_TYPE = [
+    ("Maître d'ouvrage", 1),
     ("Ingénieur", 1),
     ("Technicien", 1),
-    ("Manœuvre", 4),
-    ("Plombier", 2),
-    ("Ferrailleur", 2),
     ("Contrôleur technique", 1),
+    ("Coffreur", 2),
+    ("Ferrailleur", 2),
+    ("Plombier", 2),
+    ("Manœuvre", 4),
 ]
 TAUX_FONCTION = {
+    "Maître d'ouvrage": 0,
     "Ingénieur": 25000,
     "Technicien": 15000,
-    "Manœuvre": 5000,
-    "Plombier": 8000,
-    "Ferrailleur": 8000,
     "Contrôleur technique": 20000,
+    "Coffreur": 9000,
+    "Ferrailleur": 8000,
+    "Plombier": 8000,
+    "Manœuvre": 5000,
 }
 DEMO_CHANTIERS = [
     {
@@ -855,6 +1091,21 @@ NOMS = [
 ]
 
 
+def demo_person(i: int, used: set[str]) -> tuple[str, str]:
+    """Nom unique et numéro de téléphone fictif (format camerounais) pour la personne n° i."""
+    prenom = PRENOMS[i % len(PRENOMS)]
+    k = (i * 3 + i // len(PRENOMS)) % len(NOMS)
+    nom = f"{prenom} {NOMS[k]}"
+    for _ in range(len(NOMS)):
+        nom = f"{prenom} {NOMS[k]}"
+        if nom not in used:
+            break
+        k = (k + 1) % len(NOMS)
+    used.add(nom)
+    tel = f"+237 6{70 + i % 30} {(i * 37) % 90 + 10:02d} {(i * 53) % 90 + 10:02d} {(i * 17) % 90 + 10:02d}"
+    return nom, tel
+
+
 def team_frame(cid: int) -> pd.DataFrame:
     """Équipe d'un chantier, triée par fonction, avec une colonne N°."""
     df = query(
@@ -881,53 +1132,61 @@ def team_display(team: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def seed_intervenants_demo() -> int:
-    """Crée 4 chantiers « En cours » avec leur équipe type. Retourne le nombre de chantiers créés."""
+def seed_intervenants_demo() -> tuple[int, int]:
+    """Crée (ou complète) 4 chantiers « En cours » avec leur équipe type.
+
+    Retourne (chantiers créés, intervenants ajoutés). Peut être relancée sans créer de doublons :
+    seuls les postes manquants sont ajoutés.
+    """
     conn = get_connection()
-    created = 0
-    counter = 0
+    created = added = 0
     with _WRITE_LOCK:
         try:
+            used = {r[0] for r in conn.execute("SELECT nom FROM employes")}
+            counter = conn.execute("SELECT COUNT(*) FROM employes").fetchone()[0]
             for ch in DEMO_CHANTIERS:
-                if conn.execute("SELECT 1 FROM chantiers WHERE nom = ?", (ch["nom"],)).fetchone():
-                    continue
-                cur = conn.execute(
-                    "INSERT INTO chantiers (nom, localisation, date_debut, date_fin_prevue, budget, "
-                    "statut, avancement, notes) VALUES (?,?,?,?,?, 'En cours', ?, ?)",
-                    (
-                        ch["nom"],
-                        ch["localisation"],
-                        ch["debut"],
-                        ch["fin"],
-                        ch["budget"],
-                        ch["avancement"],
-                        "Données d'exemple : à remplacer par vos vrais chantiers et intervenants.",
-                    ),
-                )
-                cid = cur.lastrowid
+                row = conn.execute("SELECT id FROM chantiers WHERE nom = ?", (ch["nom"],)).fetchone()
+                if row:
+                    cid = row[0]
+                else:
+                    cur = conn.execute(
+                        "INSERT INTO chantiers (nom, localisation, date_debut, date_fin_prevue, budget, "
+                        "statut, avancement, notes) VALUES (?,?,?,?,?, 'En cours', ?, ?)",
+                        (
+                            ch["nom"],
+                            ch["localisation"],
+                            ch["debut"],
+                            ch["fin"],
+                            ch["budget"],
+                            ch["avancement"],
+                            "Données d'exemple : à remplacer par vos vrais chantiers et intervenants.",
+                        ),
+                    )
+                    cid = cur.lastrowid
+                    created += 1
                 for fonction, effectif in EQUIPE_TYPE:
-                    for _ in range(effectif):
-                        i = counter
+                    deja = conn.execute(
+                        "SELECT COUNT(*) FROM affectations WHERE chantier_id = ? AND fonction = ?", (cid, fonction)
+                    ).fetchone()[0]
+                    for _ in range(max(effectif - deja, 0)):
+                        nom, tel = demo_person(counter, used)
                         counter += 1
-                        nom = f"{PRENOMS[i % len(PRENOMS)]} {NOMS[(i * 3 + i // 20) % len(NOMS)]}"
-                        tel = f"+237 690 00 {i:02d} {(i * 7) % 100:02d}"
                         emp = conn.execute(
-                            "INSERT INTO employes (nom, poste, telephone, taux_journalier, actif) "
-                            "VALUES (?,?,?,?,1)",
+                            "INSERT INTO employes (nom, poste, telephone, taux_journalier, actif) VALUES (?,?,?,?,1)",
                             (nom, fonction, tel, TAUX_FONCTION[fonction]),
                         )
                         conn.execute(
                             "INSERT INTO affectations (chantier_id, employe_id, fonction) VALUES (?,?,?)",
                             (cid, emp.lastrowid, fonction),
                         )
-                created += 1
+                        added += 1
             conn.commit()
         except sqlite3.Error as exc:
             conn.rollback()
             log.exception("Création des données d'exemple annulée")
             st.error(f"Opération annulée : {exc}")
-            return 0
-    return created
+            return 0, 0
+    return created, added
 
 
 def sheet_name(cid: int, nom: str) -> str:
@@ -1082,8 +1341,9 @@ def page_intervenants() -> None:
     with tab_demo:
         st.write(
             "Crée **4 chantiers « En cours »** (Douala, Yaoundé, Kribi, Bafoussam) avec, pour chacun, "
-            "1 ingénieur, 1 technicien, 4 manœuvres, 2 plombiers, 2 ferrailleurs et 1 contrôleur technique "
-            "(11 personnes par chantier)."
+            "1 maître d'ouvrage, 1 ingénieur, 1 technicien, 1 contrôleur technique, 2 coffreurs, "
+            "2 ferrailleurs, 2 plombiers et 4 manœuvres (14 personnes par chantier). "
+            "Ils sont aussi créés automatiquement au premier lancement."
         )
         st.caption(
             "Noms, numéros de téléphone et taux sont fictifs : remplacez-les par vos données réelles "
@@ -1092,12 +1352,12 @@ def page_intervenants() -> None:
         if not can_edit():
             read_only_notice()
         elif st.button("Créer les chantiers et équipes d'exemple", type="primary", key="seed_int"):
-            created = seed_intervenants_demo()
-            if created:
-                flash(f"{created} chantier(s) d'exemple créé(s).")
+            created, added = seed_intervenants_demo()
+            if created or added:
+                flash(f"{created} chantier(s) créé(s), {added} intervenant(s) ajouté(s).")
                 st.rerun()
             else:
-                st.info("Les chantiers d'exemple existent déjà.")
+                st.info("Les chantiers d'exemple existent déjà avec leurs équipes complètes.")
 
 
 # --------------------------------------------------------------------------- #
@@ -2520,6 +2780,7 @@ def main() -> None:
         st.error(f"Impossible d'ouvrir la base de données : {exc}")
         st.stop()
 
+    ensure_demo_data()
     if not current_user():
         login_page()
         return
@@ -2542,4 +2803,3 @@ def main() -> None:
 
 
 main()
-
