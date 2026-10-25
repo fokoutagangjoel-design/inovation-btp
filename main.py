@@ -32,7 +32,7 @@ import re
 import secrets
 import sqlite3
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -466,9 +466,10 @@ svg{display:block;width:100%;height:380px;font-family:Arial,Helvetica,sans-serif
 @keyframes road{to{stroke-dashoffset:-60}}
 @keyframes grow{from{transform:scaleY(.1)}to{transform:scaleY(1)}}
 @keyframes gauge{from{stroke-dashoffset:170}to{stroke-dashoffset:var(--off)}}
-.t1{animation:driveR 17s linear infinite}
-.t2{animation:driveL 23s linear infinite;animation-delay:-9s}
-.t3{animation:driveR 29s linear infinite;animation-delay:-21s}
+.t1{animation:driveR 20s linear infinite}
+.t2{animation:driveL 24s linear infinite}
+.t3{animation:driveR 20s linear infinite;animation-delay:-10s}
+.t4{animation:driveL 24s linear infinite;animation-delay:-12s}
 .cloud{animation:cloud 60s linear infinite}
 .float{animation:floaty 4.5s ease-in-out infinite}
 .jib{animation:swing 9s ease-in-out infinite alternate}
@@ -476,12 +477,19 @@ svg{display:block;width:100%;height:380px;font-family:Arial,Helvetica,sans-serif
 .road{stroke-dasharray:30 30;animation:road 1.2s linear infinite}
 .bar{transform-box:fill-box;transform-origin:bottom;animation:grow 2.4s ease-out infinite alternate}
 .gauge{stroke-dasharray:170;animation:gauge 2.6s ease-out forwards}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes armswing{from{transform:rotate(-7deg)}to{transform:rotate(9deg)}}
+.gear{transform-box:fill-box;transform-origin:center;animation:spin 14s linear infinite}
+.gear.rev{animation-direction:reverse}
+.arm{transform-box:fill-box;transform-origin:right bottom;animation:armswing 2.6s ease-in-out infinite alternate}
+.pulse{animation:blink 1.6s ease-in-out infinite}
+.banner svg{height:200px}
 @media (prefers-reduced-motion:reduce){*{animation:none!important}.gauge{stroke-dashoffset:var(--off)}}
 """
 
 
-def _truck_svg(body: str, cab: str, label: str, direction: int, cls: str, y: int) -> str:
-    """Camion de location (benne fermée). direction = 1 vers la droite, -1 vers la gauche."""
+def _truck_svg(body: str, cab: str, direction: int, cls: str, y: int, scale: float = 1.0) -> str:
+    """Camion Bil-BTP Construction. direction = 1 vers la droite, -1 vers la gauche."""
     flip = 'transform="translate(130,0) scale(-1,1)"' if direction < 0 else ""
     text_x = 85 if direction < 0 else 45
     wheels = "".join(
@@ -489,16 +497,55 @@ def _truck_svg(body: str, cab: str, label: str, direction: int, cls: str, y: int
         for cx in (22, 62, 112)
     )
     return (
-        f'<g class="{cls}"><g transform="translate(0,{y})">'
-        f'<g {flip}>'
+        f'<g class="{cls}"><g transform="translate(0,{y}) scale({scale})">'
+        f"<g {flip}>"
         f'<rect x="0" y="-52" width="92" height="44" rx="4" fill="{body}"/>'
         f'<rect x="0" y="-18" width="92" height="5" fill="rgba(0,0,0,.18)"/>'
         f'<rect x="94" y="-40" width="36" height="32" rx="5" fill="{cab}"/>'
         f'<path d="M101 -37 h17 l8 14 h-25z" fill="#cfeaff"/>'
         f'<rect x="0" y="-12" width="130" height="6" rx="2" fill="#2b2f36"/>'
         f"{wheels}</g>"
-        f'<text x="{text_x}" y="-30" text-anchor="middle" font-size="13" font-weight="700" fill="#fff">{label}</text>'
-        f'<text x="{text_x}" y="-21" text-anchor="middle" font-size="7" fill="#fff" opacity=".85">engins &amp; matériel</text>'
+        f'<text x="{text_x}" y="-33" text-anchor="middle" font-size="14" font-weight="800" fill="#fff">BIL-BTP</text>'
+        f'<text x="{text_x}" y="-21" text-anchor="middle" font-size="8.4" font-weight="700" fill="#fff">CONSTRUCTION</text>'
+        f"</g></g>"
+    )
+
+
+def _machine_svg(kind: str, direction: int, cls: str, y: int, scale: float = 1.0) -> str:
+    """Engin de chantier : « roller » (rouleau compresseur) ou « backhoe » (tractopelle)."""
+    flip = 'transform="translate(130,0) scale(-1,1)"' if direction < 0 else ""
+    if kind == "roller":
+        text_x = 65
+        shapes = (
+            '<rect x="22" y="-40" width="86" height="18" rx="4" fill="#f2b705"/>'
+            '<rect x="40" y="-48" width="52" height="10" rx="3" fill="#d99a00"/>'
+            '<rect x="44" y="-76" width="46" height="4" rx="2" fill="#4a4f57"/>'
+            '<rect x="47" y="-74" width="3" height="34" fill="#4a4f57"/><rect x="84" y="-74" width="3" height="34" fill="#4a4f57"/>'
+            '<rect x="60" y="-54" width="12" height="14" rx="3" fill="#2a7de1"/>'
+            '<circle cx="66" cy="-60" r="6" fill="#d9a77c"/><path d="M60 -61 a6 6 0 0 1 12 0z" fill="#fff"/>'
+            '<circle cx="22" cy="-17" r="17" fill="#8d949c"/><circle cx="22" cy="-17" r="6" fill="#4a4f57"/>'
+            '<circle cx="108" cy="-17" r="17" fill="#8d949c"/><circle cx="108" cy="-17" r="6" fill="#4a4f57"/>'
+            '<path d="M22 -34 v34 M5 -17 h34 M108 -34 v34 M91 -17 h34" stroke="#6b7178" stroke-width="2"/>'
+        )
+    else:
+        text_x = 68 if direction < 0 else 62
+        shapes = (
+            '<path d="M96 -40 L128 -26" stroke="#f2b705" stroke-width="6" stroke-linecap="round"/>'
+            '<path d="M122 -38 L142 -38 L138 -14 L122 -14 Z" fill="#d99a00" stroke="#8a6200"/>'
+            '<rect x="18" y="-46" width="86" height="24" rx="5" fill="#f2b705"/>'
+            '<rect x="40" y="-78" width="40" height="34" rx="4" fill="#f2b705"/>'
+            '<rect x="45" y="-73" width="30" height="22" rx="2" fill="#cfeaff"/>'
+            '<circle cx="60" cy="-60" r="6" fill="#d9a77c"/><path d="M54 -61 a6 6 0 0 1 12 0z" fill="#fff"/>'
+            '<g class="arm"><path d="M20 -44 L-6 -72 L-26 -34" fill="none" stroke="#f2b705" stroke-width="6" '
+            'stroke-linejoin="round" stroke-linecap="round"/>'
+            '<path d="M-34 -36 L-18 -36 L-22 -16 L-38 -20 Z" fill="#d99a00" stroke="#8a6200"/></g>'
+            '<circle cx="38" cy="-17" r="17" fill="#1d2025"/><circle cx="38" cy="-17" r="7" fill="#9aa3ad"/>'
+            '<circle cx="100" cy="-12" r="12" fill="#1d2025"/><circle cx="100" cy="-12" r="5" fill="#9aa3ad"/>'
+        )
+    return (
+        f'<g class="{cls}"><g transform="translate(0,{y}) scale({scale})">'
+        f"<g {flip}>{shapes}</g>"
+        f'<text x="{text_x}" y="-28" text-anchor="middle" font-size="9" font-weight="800" fill="#3a2f00">BIL-BTP</text>'
         f"</g></g>"
     )
 
@@ -575,9 +622,10 @@ def hero_html(chantiers: list[tuple[str, int]] | None = None, proba: float | Non
     best = f"{proba:.0f}%" if proba is not None else "%"
     gauge_off = 170 * (1 - (proba / 100 if proba is not None else 0.72))
     trucks = (
-        _truck_svg("#1f6fd1", "#174f98", "LOCATION", 1, "t1", 330)
-        + _truck_svg("#f08a24", "#c26a14", "LOCATION BTP", -1, "t2", 352)
-        + _truck_svg("#2e9e6b", "#217350", "LOCATION", 1, "t3", 352)
+        _truck_svg("#1f6fd1", "#174f98", 1, "t1", 330)
+        + _truck_svg("#f08a24", "#c26a14", -1, "t2", 352)
+        + _machine_svg("roller", 1, "t3", 330)
+        + _machine_svg("backhoe", -1, "t4", 352)
     )
     bars = "".join(
         f'<rect class="bar" x="{1062 + k * 21}" y="{104 - bh}" width="14" height="{bh}" rx="2" fill="#2a7de1" '
@@ -611,7 +659,7 @@ def hero_html(chantiers: list[tuple[str, int]] | None = None, proba: float | Non
 """
     svg = f"""
 <svg viewBox="0 0 1200 360" preserveAspectRatio="xMidYMax slice" role="img"
-     aria-label="Chantiers en construction, camions de location et analyse de probabilité">
+     aria-label="Chantiers en construction, camions Bil-BTP Construction, engins et analyse de probabilité">
 <defs><linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
 <stop offset="0" stop-color="#1f4e79"/><stop offset=".6" stop-color="#4f93cf"/><stop offset="1" stop-color="#f6d9a8"/></linearGradient></defs>
 <rect width="1200" height="360" fill="url(#sky)"/>
@@ -625,7 +673,7 @@ def hero_html(chantiers: list[tuple[str, int]] | None = None, proba: float | Non
 {crane}
 {cards}
 <text x="40" y="50" font-size="31" font-weight="800" fill="#fff" stroke="#14202e" stroke-opacity=".35" stroke-width="3" paint-order="stroke">INNOVATION BTP</text>
-<text x="40" y="74" font-size="14" fill="#fff" stroke="#14202e" stroke-opacity=".35" stroke-width="2.5" paint-order="stroke">Chantiers · Marchés · Analyse de probabilité · Location d'engins</text>
+<text x="40" y="74" font-size="14" fill="#fff" stroke="#14202e" stroke-opacity=".35" stroke-width="2.5" paint-order="stroke">Chantiers · Marchés · Analyse de probabilité · Engins de chantier</text>
 {trucks}
 </svg>"""
     return (
@@ -638,21 +686,515 @@ def render_hero(chantiers: list[tuple[str, int]] | None = None, proba: float | N
     components.html(hero_html(chantiers, proba), height=384)
 
 
+# --------------------------------------------------------------------------- #
+# Arrière-plans animés : un bandeau thématique pour chaque option de l'application
+# --------------------------------------------------------------------------- #
+def _windows(x: float, top: float, w: float, h: float, seed: int = 0) -> str:
+    out = []
+    cols = max(int((w - 10) // 18), 2)
+    sp = (w - 12) / cols
+    for r in range(int((h - 10) // 20)):
+        for c in range(cols):
+            wx = x + 6 + c * sp + (sp - 10) / 2
+            wy = top + 10 + r * 20
+            if wy + 12 > 166:
+                continue
+            lit = (r + c + seed) % 4 != 0
+            cls = ' class="win"' if lit else ""
+            fill = "#ffe38a" if lit else "#26303b"
+            delay = ((seed * 5 + r * 3 + c * 7) % 9) * 0.45
+            out.append(
+                f'<rect{cls} x="{wx:.1f}" y="{wy:.1f}" width="10" height="12" rx="1.5" fill="{fill}" '
+                f'style="animation-delay:{delay:.2f}s"/>'
+            )
+    return "".join(out)
+
+
+def _worker(x: float, helmet: str, shirt: str, tool: str = "none", ground: int = 170, cls: str = "") -> str:
+    tools = {
+        "hammer": '<line x1="10" y1="-42" x2="24" y2="-60" stroke="#8b5a2b" stroke-width="3"/>'
+        '<rect x="18" y="-66" width="14" height="7" fill="#555" transform="rotate(35 25 -62)"/>',
+        "clip": '<rect x="10" y="-50" width="13" height="17" fill="#fff" stroke="#555"/>'
+        '<line x1="13" y1="-45" x2="20" y2="-45" stroke="#999"/><line x1="13" y1="-40" x2="20" y2="-40" stroke="#999"/>',
+        "none": "",
+    }
+    return (
+        f'<g transform="translate({x},{ground})"><g class="{cls}">'
+        f'<rect x="-8" y="-24" width="7" height="24" fill="#2f3b4a"/><rect x="1" y="-24" width="7" height="24" fill="#2f3b4a"/>'
+        f'<rect x="-10" y="-52" width="20" height="30" rx="5" fill="{shirt}"/>'
+        f'<rect x="-15" y="-50" width="6" height="20" rx="3" fill="{shirt}"/>'
+        f'<rect x="-5" y="-46" width="10" height="6" fill="#fff"/>'
+        f'<circle cx="0" cy="-62" r="9" fill="#d9a77c"/>'
+        f'<path d="M-11 -64 a11 11 0 0 1 22 0 z" fill="{helmet}"/><rect x="-13" y="-65" width="26" height="3" rx="1.5" fill="{helmet}"/>'
+        f"{tools[tool]}</g></g>"
+    )
+
+
+def _gear(cx: float, cy: float, r: float, teeth: int, fill: str, rev: bool = False) -> str:
+    pts = []
+    n = teeth * 4
+    for k in range(n):
+        ang = 2 * math.pi * k / n
+        rad = r if k % 4 in (0, 1) else r * 0.78
+        pts.append(f"{cx + rad * math.cos(ang):.1f},{cy + rad * math.sin(ang):.1f}")
+    cls = "gear rev" if rev else "gear"
+    return (
+        f'<g class="{cls}"><polygon points="{" ".join(pts)}" fill="{fill}" stroke="#14202e" stroke-opacity=".4"/>'
+        f'<circle cx="{cx}" cy="{cy}" r="{r * 0.34:.1f}" fill="#2f3640"/></g>'
+    )
+
+
+def _pie(cx: float, cy: float, r: float, parts: list[float], colors: list[str]) -> str:
+    out, start = [], -math.pi / 2
+    for frac, col in zip(parts, colors):
+        end = start + 2 * math.pi * frac
+        x1, y1 = cx + r * math.cos(start), cy + r * math.sin(start)
+        x2, y2 = cx + r * math.cos(end), cy + r * math.sin(end)
+        large = 1 if frac > 0.5 else 0
+        out.append(f'<path d="M{cx} {cy} L{x1:.1f} {y1:.1f} A{r} {r} 0 {large} 1 {x2:.1f} {y2:.1f} Z" fill="{col}"/>')
+        start = end
+    return "".join(out)
+
+
+def _card(x: float, y: float, w: float, h: float, delay: float = 0.0) -> str:
+    return (
+        f'<rect class="float" x="{x}" y="{y}" width="{w}" height="{h}" rx="12" fill="#fff" fill-opacity=".93" '
+        f'style="animation-delay:{delay}s"/>'
+    )
+
+
+def _motif_chantiers() -> str:
+    out = []
+    for i, (x, w, h, col) in enumerate([(650, 90, 95, "#5b7fa6"), (760, 100, 125, "#7a8fb5"), (880, 90, 70, "#6c9a8b"), (980, 85, 108, "#a58b6f")]):
+        top = 170 - h
+        out.append(f'<rect x="{x}" y="{top}" width="{w}" height="{h}" fill="{col}" rx="3"/>')
+        out.append(f'<rect x="{x - 3}" y="{top - 5}" width="{w + 6}" height="7" fill="#2f3b4a" rx="2"/>')
+        out.append(_windows(x, top, w, h, i))
+    out.append(
+        '<rect x="1107" y="22" width="6" height="148" fill="#e8b923"/>'
+        '<g class="jib" style="transform-origin:1110px 26px"><rect x="1030" y="22" width="150" height="5" fill="#e8b923"/>'
+        '<rect x="1020" y="18" width="14" height="14" fill="#4a4f57"/>'
+        '<line x1="1160" y1="27" x2="1160" y2="78" stroke="#222" stroke-width="1.5"/>'
+        '<rect x="1153" y="78" width="14" height="10" rx="2" fill="#e8b923"/></g>'
+    )
+    return "".join(out)
+
+
+def _motif_equipe(personnel: bool = False) -> str:
+    helmets = ["#f2c200", "#ffffff", "#ff7a1a", "#2a7de1", "#e03b3b", "#2e9e6b"]
+    shirts = ["#2a7de1", "#e8e8e8", "#f08a24", "#2e9e6b", "#8a7ca8", "#e0b84a"]
+    tools = ["hammer", "clip", "none", "clip", "hammer", "none"]
+    xs = [680, 760, 840, 920] if personnel else [660, 740, 820, 900, 980, 1060]
+    out = [
+        _worker(x, helmets[i], shirts[i], tools[i], cls="float" if i % 2 else "")
+        for i, x in enumerate(xs)
+    ]
+    if personnel:
+        out.append(
+            '<rect x="1010" y="24" width="160" height="112" rx="10" fill="#fff" fill-opacity=".93"/>'
+            '<text x="1090" y="44" text-anchor="middle" font-size="11" font-weight="700" fill="#27415f">Pointage</text>'
+            + "".join(f'<line x1="1022" y1="{54 + k * 18}" x2="1158" y2="{54 + k * 18}" stroke="#dbe5f1"/>' for k in range(5))
+            + "".join(
+                f'<path d="M{1030 + c * 26} {62 + r * 18} l4 5 l9 -11" fill="none" stroke="#2e9e6b" stroke-width="2.5"/>'
+                for r in range(4)
+                for c in range(5)
+                if (r + c) % 3 != 0
+            )
+        )
+    return "".join(out)
+
+
+def _person_suit(x: float, tie: str) -> str:
+    return (
+        f'<g transform="translate({x},170)"><rect x="-12" y="-36" width="9" height="36" fill="#2f3b4a"/>'
+        f'<rect x="3" y="-36" width="9" height="36" fill="#2f3b4a"/>'
+        f'<rect x="-16" y="-84" width="32" height="50" rx="8" fill="#27415f"/>'
+        f'<path d="M-6 -84 L0 -66 L6 -84 Z" fill="#fff"/><path d="M0 -78 l-3 6 l3 14 l3 -14 z" fill="{tie}"/>'
+        f'<circle cx="0" cy="-98" r="12" fill="#d9a77c"/><path d="M-12 -101 a12 12 0 0 1 24 -2 z" fill="#2b2118"/></g>'
+    )
+
+
+def _motif_clients() -> str:
+    return (
+        '<polygon points="640,92 690,56 740,92" fill="#a0402f"/><rect x="650" y="92" width="80" height="78" fill="#e8d8b8"/>'
+        '<rect x="680" y="126" width="20" height="44" fill="#7a4b2a"/><rect x="658" y="104" width="16" height="16" fill="#9ed0f0"/>'
+        '<rect x="706" y="104" width="16" height="16" fill="#9ed0f0"/>'
+        + _person_suit(800, "#c0392b")
+        + _person_suit(880, "#2a7de1")
+        + '<g transform="translate(0,120)"><rect x="822" y="0" width="30" height="10" rx="5" fill="#d9a77c"/>'
+        '<rect x="832" y="2" width="26" height="10" rx="5" fill="#c99467"/></g>'
+        '<g class="float"><rect x="950" y="36" width="110" height="118" rx="8" fill="#fff" fill-opacity=".95"/>'
+        '<text x="1005" y="56" text-anchor="middle" font-size="11" font-weight="800" fill="#27415f">CONTRAT</text>'
+        + "".join(f'<line x1="962" y1="{68 + k * 11}" x2="1048" y2="{68 + k * 11}" stroke="#c8d3e0" stroke-width="2"/>' for k in range(5))
+        + '<path d="M964 140 q10 -22 18 -4 t18 -2 t18 -6" fill="none" stroke="#2a7de1" stroke-width="2.2"/></g>'
+        '<polygon points="1090,100 1130,70 1170,100" fill="#a0402f"/><rect x="1098" y="100" width="64" height="70" fill="#e8d8b8"/>'
+        '<rect x="1122" y="132" width="16" height="38" fill="#7a4b2a"/>'
+    )
+
+
+def _motif_devis() -> str:
+    rows = "".join(
+        f'<line x1="716" y1="{66 + k * 16}" x2="790" y2="{66 + k * 16}" stroke="#c8d3e0" stroke-width="3"/>'
+        f'<rect x="808" y="{61 + k * 16}" width="36" height="8" rx="2" fill="#dbe5f1"/>'
+        for k in range(5)
+    )
+    keys = "".join(
+        f'<rect x="{918 + c * 26}" y="{82 + r * 22}" width="20" height="16" rx="3" fill="{"#f08a24" if c == 3 else "#dbe5f1"}"/>'
+        for r in range(3)
+        for c in range(4)
+    )
+    return (
+        '<g class="float"><rect x="700" y="20" width="160" height="142" rx="8" fill="#fff" fill-opacity=".95"/>'
+        '<text x="716" y="44" font-size="14" font-weight="800" fill="#27415f">DEVIS</text>'
+        f"{rows}"
+        '<rect x="712" y="146" width="136" height="12" rx="3" fill="#2e9e6b" fill-opacity=".25"/>'
+        '<text x="720" y="156" font-size="9" font-weight="800" fill="#1d3b2c">TOTAL TTC</text></g>'
+        '<g class="float" style="animation-delay:-1.5s"><rect x="906" y="30" width="116" height="128" rx="10" fill="#27415f"/>'
+        '<rect x="916" y="40" width="96" height="30" rx="4" fill="#bfe6c9"/>'
+        '<text x="1006" y="62" text-anchor="end" font-size="16" font-weight="700" fill="#1d3b2c">19,25 %</text>'
+        f"{keys}</g>"
+        '<g transform="rotate(35 1060 100)"><rect x="1040" y="90" width="90" height="12" rx="3" fill="#f2c200"/>'
+        '<polygon points="1130,90 1146,96 1130,102" fill="#e8c9a0"/><rect x="1040" y="90" width="14" height="12" fill="#e57373"/></g>'
+        '<g transform="rotate(-14 1110 140)"><circle cx="1110" cy="140" r="26" fill="none" stroke="#2e9e6b" stroke-width="3"/>'
+        '<text x="1110" y="144" text-anchor="middle" font-size="10" font-weight="800" fill="#2e9e6b">ACCEPTÉ</text></g>'
+    )
+
+
+def _motif_marches() -> str:
+    bars = "".join(
+        f'<rect class="bar" x="{818 + k * 20}" y="{112 - bh}" width="13" height="{bh}" rx="2" fill="#2a7de1" '
+        f'style="animation-delay:{k * 0.25:.2f}s"/>'
+        for k, bh in enumerate([20, 34, 28, 48, 62])
+    )
+    return (
+        _card(640, 24, 140, 96)
+        + '<path d="M654 102 C672 102 684 48 710 48 S748 102 766 102 Z" fill="#cfe3fb" stroke="#2a7de1" stroke-width="2"/>'
+        '<path d="M718 102 L718 54 C736 58 750 102 766 102 Z" fill="#2a7de1" fill-opacity=".55"/>'
+        '<text x="710" y="116" text-anchor="middle" font-size="9" font-weight="700" fill="#27415f">μ ± σ</text>'
+        + _card(796, 24, 130, 96, -1.0)
+        + bars
+        + '<line x1="808" y1="112" x2="916" y2="112" stroke="#8aa0b8"/>'
+        + _card(942, 24, 92, 110, -2.0)
+        + '<circle cx="988" cy="74" r="27" fill="none" stroke="#dbe5f1" stroke-width="9"/>'
+        '<circle class="gauge" cx="988" cy="74" r="27" fill="none" stroke="#2e9e6b" stroke-width="9" stroke-linecap="round" '
+        'transform="rotate(-90 988 74)" style="--off:48"/>'
+        '<text x="988" y="79" text-anchor="middle" font-size="14" font-weight="800" fill="#1d3b2c">%</text>'
+        '<text x="988" y="124" text-anchor="middle" font-size="9" font-weight="700" fill="#27415f">P(gain)</text>'
+        + _card(1050, 24, 130, 110, -3.0)
+        + '<g transform="rotate(-12 1090 70)"><rect x="1072" y="50" width="36" height="36" rx="7" fill="#fff" stroke="#27415f" stroke-width="2"/>'
+        '<circle cx="1082" cy="60" r="3" fill="#27415f"/><circle cx="1098" cy="60" r="3" fill="#27415f"/>'
+        '<circle cx="1090" cy="68" r="3" fill="#27415f"/><circle cx="1082" cy="76" r="3" fill="#27415f"/><circle cx="1098" cy="76" r="3" fill="#27415f"/></g>'
+        '<g transform="rotate(14 1140 80)"><rect x="1124" y="64" width="32" height="32" rx="7" fill="#fff" stroke="#27415f" stroke-width="2"/>'
+        '<circle cx="1133" cy="73" r="3" fill="#27415f"/><circle cx="1147" cy="87" r="3" fill="#27415f"/></g>'
+        '<polyline points="1064,122 1088,112 1106,116 1130,100 1166,88" fill="none" stroke="#2e9e6b" stroke-width="3" stroke-linecap="round"/>'
+    )
+
+
+def _motif_stock() -> str:
+    out = []
+    for row, (n, y, x0) in enumerate([(3, 146, 650), (2, 122, 674), (1, 98, 698)]):
+        for k in range(n):
+            x = x0 + k * 48
+            out.append(f'<rect x="{x}" y="{y}" width="46" height="24" rx="8" fill="#d6cdbb" stroke="#8c8573"/>')
+            out.append(f'<text x="{x + 23}" y="{y + 15}" text-anchor="middle" font-size="7.5" font-weight="800" fill="#6b4f2a">CIMENT</text>')
+    for k in range(7):
+        out.append(f'<line x1="830" y1="{148 + k * 3.2:.1f}" x2="930" y2="{148 + k * 3.2:.1f}" stroke="#8a6a4f" stroke-width="4" stroke-linecap="round"/>')
+    out.append('<rect x="850" y="142" width="5" height="32" fill="#555"/><rect x="900" y="142" width="5" height="32" fill="#555"/>')
+    for row, (n, y) in enumerate([(5, 158), (4, 148), (3, 138)]):
+        for k in range(n):
+            x = 960 + k * 24 + row * 12
+            out.append(f'<rect x="{x}" y="{y}" width="22" height="10" fill="#b5543a" stroke="#7d3623"/>')
+    out.append(
+        '<rect x="1070" y="162" width="90" height="8" fill="#b98b52"/><rect x="1076" y="170" width="12" height="0" fill="#b98b52"/>'
+        '<rect x="1078" y="128" width="38" height="34" fill="#c9a27a" stroke="#8c6a46"/><rect x="1120" y="140" width="34" height="22" fill="#d8b48a" stroke="#8c6a46"/>'
+        '<g class="pulse"><polygon points="1150,40 1176,86 1124,86" fill="#f2c200" stroke="#7a5b00" stroke-width="2"/>'
+        '<text x="1150" y="78" text-anchor="middle" font-size="22" font-weight="900" fill="#7a5b00">!</text></g>'
+    )
+    return "".join(out)
+
+
+def _motif_depenses() -> str:
+    out = []
+    for x, n in [(670, 3), (716, 6), (762, 2)]:
+        for k in range(n):
+            out.append(f'<ellipse cx="{x}" cy="{164 - k * 8}" rx="21" ry="8" fill="#f2c200" stroke="#a67c00" stroke-width="1.5"/>')
+    out.append(
+        '<g class="float"><rect x="816" y="104" width="96" height="50" rx="5" fill="#7ac47f" stroke="#2e7d32" stroke-width="2" transform="rotate(-6 864 129)"/>'
+        '<circle cx="864" cy="129" r="14" fill="#e8f5e9" stroke="#2e7d32" transform="rotate(-6 864 129)"/>'
+        '<text x="864" y="134" text-anchor="middle" font-size="12" font-weight="800" fill="#1b5e20" transform="rotate(-6 864 129)">F</text></g>'
+    )
+    out.append(_card(934, 24, 150, 112, -1.2))
+    for k, bh in enumerate([30, 46, 38, 62, 52]):
+        out.append(
+            f'<rect class="bar" x="{950 + k * 26}" y="{116 - bh}" width="18" height="{bh}" rx="2" '
+            f'fill="{"#e0603b" if k == 3 else "#2e9e6b"}" style="animation-delay:{k * 0.2:.1f}s"/>'
+        )
+    out.append(
+        '<line x1="944" y1="116" x2="1074" y2="116" stroke="#8aa0b8"/>'
+        '<text x="1009" y="40" text-anchor="middle" font-size="10" font-weight="700" fill="#27415f">FCFA par mois</text>'
+        '<g class="float" style="animation-delay:-2s"><path d="M1102 36 h70 v112 l-9 -7 l-9 7 l-9 -7 l-9 7 l-9 -7 l-9 7 l-8 -7 z" fill="#fff" fill-opacity=".95"/>'
+        + "".join(f'<line x1="1112" y1="{54 + k * 14}" x2="1160" y2="{54 + k * 14}" stroke="#c8d3e0" stroke-width="3"/>' for k in range(6))
+        + "</g>"
+    )
+    return "".join(out)
+
+
+def _motif_rapports() -> str:
+    return (
+        _card(650, 24, 180, 112)
+        + '<polyline points="666,116 696,94 726,102 760,66 790,74 818,44" fill="none" stroke="#2a7de1" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>'
+        '<line x1="660" y1="122" x2="822" y2="122" stroke="#8aa0b8"/>'
+        + _card(846, 24, 120, 112, -1.4)
+        + _pie(906, 80, 38, [0.45, 0.30, 0.25], ["#2a7de1", "#2e9e6b", "#f08a24"])
+        + '<g class="float" style="animation-delay:-2.4s"><rect x="990" y="36" width="82" height="108" rx="6" fill="#fff" fill-opacity=".96"/>'
+        '<rect x="1002" y="50" width="36" height="36" rx="4" fill="#1d6f42"/>'
+        '<text x="1020" y="76" text-anchor="middle" font-size="22" font-weight="900" fill="#fff">X</text>'
+        + "".join(f'<line x1="1002" y1="{100 + k * 10}" x2="1060" y2="{100 + k * 10}" stroke="#c8d3e0" stroke-width="3"/>' for k in range(4))
+        + '</g><g class="float" style="animation-delay:-0.6s"><rect x="1092" y="48" width="78" height="100" rx="6" fill="#fff" fill-opacity=".96"/>'
+        '<rect x="1104" y="60" width="38" height="24" rx="4" fill="#c0392b"/>'
+        '<text x="1123" y="77" text-anchor="middle" font-size="12" font-weight="900" fill="#fff">PDF</text>'
+        + "".join(f'<line x1="1104" y1="{98 + k * 10}" x2="1158" y2="{98 + k * 10}" stroke="#c8d3e0" stroke-width="3"/>' for k in range(4))
+        + "</g>"
+    )
+
+
+def _motif_parametres() -> str:
+    return (
+        _gear(760, 96, 48, 10, "#c9d1da")
+        + _gear(850, 68, 32, 8, "#f08a24", rev=True)
+        + _gear(884, 136, 26, 7, "#2a7de1")
+        + '<g class="float"><rect x="990" y="82" width="64" height="52" rx="8" fill="#f2c200" stroke="#7a5b00" stroke-width="2"/>'
+        '<path d="M1002 82 v-16 a20 20 0 0 1 40 0 v16" fill="none" stroke="#6b7178" stroke-width="7"/>'
+        '<circle cx="1022" cy="106" r="6" fill="#7a5b00"/><rect x="1020" y="108" width="4" height="14" fill="#7a5b00"/></g>'
+        '<g class="float" style="animation-delay:-1.8s"><path d="M1118 40 l44 14 v34 c0 26 -20 40 -44 52 c-24 -12 -44 -26 -44 -52 v-34 z" fill="#2e9e6b" stroke="#1d3b2c" stroke-width="2"/>'
+        '<path d="M1098 94 l14 14 l26 -30" fill="none" stroke="#fff" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/></g>'
+    )
+
+
+BANNER_THEMES = {
+    "chantiers": ("Chantiers", "Suivi des chantiers en cours, budgets et avancement", ("#1f4e79", "#4f93cf", "#f6d9a8"), _motif_chantiers),
+    "intervenants": ("Intervenants", "Équipes par chantier : ingénieur, techniciens, ouvriers, contrôle", ("#14506b", "#3a9aa8", "#f2dcae"), _motif_equipe),
+    "clients": ("Clients", "Maîtres d'ouvrage, contacts et contrats", ("#3b3f7a", "#7b86c9", "#f2d9c4"), _motif_clients),
+    "devis": ("Devis", "Chiffrage, TVA et suivi des offres", ("#1d4b3f", "#4aa38a", "#f3e3b3"), _motif_devis),
+    "marches": ("Marchés BTP", "Prix, concurrence et probabilité de gain", ("#1f4e79", "#4f93cf", "#f6d9a8"), _motif_marches),
+    "stock": ("Stock", "Matériaux, entrées et sorties, alertes de seuil", ("#6b3a1f", "#c98a4b", "#f6d9a8"), _motif_stock),
+    "personnel": ("Personnel", "Employés, pointages et coût de main-d'œuvre", ("#7a3d12", "#e08a3c", "#f9dca8"), lambda: _motif_equipe(True)),
+    "depenses": ("Dépenses", "Dépenses par chantier et par catégorie", ("#15522f", "#4fae6b", "#efe3a8"), _motif_depenses),
+    "rapports": ("Rapports", "Synthèses par chantier et exports Excel", ("#2b3a55", "#6b86b3", "#e3d9c3"), _motif_rapports),
+    "parametres": ("Paramètres", "Utilisateurs, sécurité et sauvegarde", ("#2f3640", "#6c7a89", "#d9d2c3"), _motif_parametres),
+}
+BANNER_KEYS = {
+    "Chantiers": "chantiers",
+    "Intervenants": "intervenants",
+    "Clients": "clients",
+    "Devis": "devis",
+    "Marchés BTP": "marches",
+    "Stock": "stock",
+    "Personnel": "personnel",
+    "Dépenses": "depenses",
+    "Rapports": "rapports",
+    "Paramètres": "parametres",
+}
+
+
+def banner_html(theme: str) -> str:
+    """Bandeau animé (1200 x 200) propre à une page : décor du thème + engin de chantier qui passe."""
+    title, subtitle, (c1, c2, c3), motif = BANNER_THEMES[theme]
+    idx = list(BANNER_THEMES).index(theme)
+    if idx % 2 == 0:
+        vehicles = _truck_svg("#1f6fd1", "#174f98", 1, "t1", 194, 0.6) + _machine_svg("roller", -1, "t4", 194, 0.6)
+    else:
+        vehicles = _machine_svg("backhoe", 1, "t1", 194, 0.6) + _truck_svg("#f08a24", "#c26a14", -1, "t2", 194, 0.6)
+    svg = f"""
+<svg viewBox="0 0 1200 200" preserveAspectRatio="xMidYMax slice" role="img" aria-label="{html.escape(title)}">
+<defs><linearGradient id="sk" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0" stop-color="{c1}"/><stop offset=".62" stop-color="{c2}"/><stop offset="1" stop-color="{c3}"/></linearGradient></defs>
+<rect width="1200" height="200" fill="url(#sk)"/>
+<g class="cloud"><ellipse cx="0" cy="40" rx="42" ry="12" fill="#fff" opacity=".45"/><ellipse cx="24" cy="33" rx="28" ry="11" fill="#fff" opacity=".45"/></g>
+<g class="cloud" style="animation-delay:-28s"><ellipse cx="0" cy="92" rx="34" ry="10" fill="#fff" opacity=".35"/></g>
+<rect y="170" width="1200" height="30" fill="#3a3f47"/><rect y="170" width="1200" height="6" fill="#9aa0a6"/>
+<line class="road" x1="0" y1="187" x2="1200" y2="187" stroke="#f2f2f2" stroke-width="2"/>
+{motif()}
+<text x="36" y="66" font-size="31" font-weight="800" fill="#fff" stroke="#14202e" stroke-opacity=".35" stroke-width="3" paint-order="stroke">{html.escape(title)}</text>
+<text x="36" y="92" font-size="14" fill="#fff" stroke="#14202e" stroke-opacity=".35" stroke-width="2.5" paint-order="stroke">{html.escape(subtitle)}</text>
+<rect x="36" y="106" width="178" height="22" rx="11" fill="#14202e" fill-opacity=".45"/>
+<text x="125" y="121" text-anchor="middle" font-size="11.5" font-weight="800" fill="#fff">BIL-BTP CONSTRUCTION</text>
+{vehicles}
+</svg>"""
+    return (
+        '<!doctype html><html><head><meta charset="utf-8">'
+        f'<style>{HERO_CSS}</style></head><body><div class="wrap banner">{svg}</div></body></html>'
+    )
+
+
+def render_banner(theme: str) -> None:
+    components.html(banner_html(theme), height=204)
+
+
+# --------------------------------------------------------------------------- #
+# Données d'exemple : clients, devis et dépenses liés aux 4 chantiers en cours
+# --------------------------------------------------------------------------- #
+DEMO_GESTION = {
+    "Immeuble R+3 Bonamoussadi (démo)": {
+        "client": ("Société Immobilière Horizon SARL", "+237 699 12 34 56", "contact@horizon-demo.cm", "Bonamoussadi, Douala"),
+        "lignes": [
+            ("Terrassement et fondations", "forfait", 1, 0.14),
+            ("Gros œuvre béton armé (poteaux, poutres, dalles)", "m³", 320, 0.34),
+            ("Maçonnerie et cloisons", "m²", 1850, 0.14),
+            ("Plomberie sanitaire", "forfait", 1, 0.09),
+            ("Électricité courants forts et faibles", "forfait", 1, 0.09),
+            ("Menuiserie, carrelage et peinture", "m²", 1400, 0.20),
+        ],
+        "avenant": [("Étanchéité de la terrasse", "m²", 260, 0.6), ("Local technique supplémentaire", "forfait", 1, 0.4)],
+    },
+    "Villa duplex Bastos (démo)": {
+        "client": ("M. et Mme Ateba (particuliers)", "+237 677 45 21 08", "famille.ateba@demo-mail.cm", "Bastos, Yaoundé"),
+        "lignes": [
+            ("Terrassement et fondations", "forfait", 1, 0.12),
+            ("Élévation des murs en agglomérés", "m²", 640, 0.22),
+            ("Dalles et charpente béton", "m³", 85, 0.18),
+            ("Couverture et étanchéité", "m²", 240, 0.10),
+            ("Plomberie et sanitaires", "forfait", 1, 0.08),
+            ("Électricité", "forfait", 1, 0.08),
+            ("Carrelage, menuiserie et peinture", "m²", 420, 0.17),
+            ("Aménagements extérieurs et clôture", "forfait", 1, 0.05),
+        ],
+        "avenant": [("Piscine : terrassement et coque", "forfait", 1, 0.7), ("Portail motorisé", "u", 1, 0.3)],
+    },
+    "Pont de desserte Kribi (démo)": {
+        "client": ("Délégation régionale des Travaux publics du Sud", "+237 233 46 11 22", "drtp-sud@demo-admin.cm", "Kribi"),
+        "lignes": [
+            ("Installation de chantier et études d'exécution", "forfait", 1, 0.06),
+            ("Terrassement et remblais d'accès", "m³", 5200, 0.10),
+            ("Fondations profondes (pieux forés)", "m", 420, 0.22),
+            ("Culées et piles en béton armé", "m³", 780, 0.24),
+            ("Tablier : poutres préfabriquées et dalle", "m²", 640, 0.22),
+            ("Chaussée, étanchéité et garde-corps", "m", 85, 0.10),
+            ("Signalisation et finitions", "forfait", 1, 0.06),
+        ],
+        "avenant": [("Enrochement de protection des berges", "m³", 900, 1.0)],
+    },
+    "Entrepôt logistique Bafoussam (démo)": {
+        "client": ("Groupe Logistique Ouest SA", "+237 655 90 34 71", "direction@logistique-ouest-demo.cm", "Zone industrielle, Bafoussam"),
+        "lignes": [
+            ("Terrassement et plateforme", "m³", 4200, 0.12),
+            ("Fondations et dallage industriel", "m²", 3200, 0.26),
+            ("Charpente métallique", "t", 58, 0.22),
+            ("Bardage et couverture", "m²", 3600, 0.16),
+            ("Quais de chargement et portes sectionnelles", "u", 6, 0.09),
+            ("Électricité et éclairage", "forfait", 1, 0.08),
+            ("Voirie et parking", "m²", 2400, 0.07),
+        ],
+        "avenant": [("Extension du quai n°7", "forfait", 1, 0.6), ("Bureau d'exploitation préfabriqué", "u", 1, 0.4)],
+    },
+}
+DEPENSES_TYPE = [
+    ("Matériaux", 0.45, ["Ciment CPJ 42,5 et liants", "Fer à béton HA8 à HA16", "Sable, gravier et agglomérés"]),
+    ("Main-d'œuvre", 0.25, ["Paie quinzaine : équipe gros œuvre", "Paie quinzaine : ferrailleurs et coffreurs", "Paie quinzaine : finitions et manœuvres"]),
+    ("Location d'engins", 0.10, ["Location tractopelle Bil-BTP", "Location rouleau compresseur Bil-BTP", "Location camion benne Bil-BTP"]),
+    ("Transport", 0.07, ["Transport de matériaux", "Livraison de béton prêt à l'emploi", "Évacuation des déblais"]),
+    ("Sous-traitance", 0.10, ["Sous-traitance électricité", "Sous-traitance plomberie", "Sous-traitance étanchéité"]),
+    ("Administratif", 0.03, ["Assurance chantier", "Frais d'études et plans", "Taxes et autorisations"]),
+]
+DATE_REFERENCE_DEMO = date(2026, 10, 15)
+
+
+def seed_gestion_demo() -> tuple[int, int, int]:
+    """Remplit clients, devis (avec lignes) et dépenses pour les chantiers d'exemple.
+
+    Retourne (clients créés, devis créés, dépenses créées). Sans doublon si relancée.
+    """
+    conn = get_connection()
+    n_cl = n_dv = n_dep = 0
+    with _WRITE_LOCK:
+        try:
+            for idx, ch in enumerate(DEMO_CHANTIERS, start=1):
+                g = DEMO_GESTION.get(ch["nom"])
+                row = conn.execute(
+                    "SELECT id, budget, avancement, date_debut, client_id FROM chantiers WHERE nom = ?", (ch["nom"],)
+                ).fetchone()
+                if not g or not row:
+                    continue
+                cid, budget, avancement, debut, client_id = row
+                nom_cl, tel, mail, adresse = g["client"]
+                found = conn.execute("SELECT id FROM clients WHERE nom = ?", (nom_cl,)).fetchone()
+                if found:
+                    client = found[0]
+                else:
+                    client = conn.execute(
+                        "INSERT INTO clients (nom, telephone, email, adresse) VALUES (?,?,?,?)", (nom_cl, tel, mail, adresse)
+                    ).lastrowid
+                    n_cl += 1
+                if not client_id:
+                    conn.execute("UPDATE chantiers SET client_id = ? WHERE id = ?", (client, cid))
+
+                total_ht = round(budget / (1 + TVA_DEFAUT / 100) / 1000) * 1000
+                for numero, lignes, montant, statut, jour in (
+                    (f"DV-DEMO-{idx:02d}", g["lignes"], total_ht, "Accepté", debut),
+                    (f"DV-DEMO-{idx:02d}-A", g["avenant"], total_ht * 0.06, "Envoyé", "2026-09-20"),
+                ):
+                    if conn.execute("SELECT 1 FROM devis WHERE numero = ?", (numero,)).fetchone():
+                        continue
+                    did = conn.execute(
+                        "INSERT INTO devis (numero, client_id, chantier_id, date, statut, tva) VALUES (?,?,?,?,?,?)",
+                        (numero, client, cid, jour, statut, TVA_DEFAUT),
+                    ).lastrowid
+                    for designation, unite, qte, part in lignes:
+                        conn.execute(
+                            "INSERT INTO devis_lignes (devis_id, designation, quantite, unite, prix_unitaire) VALUES (?,?,?,?,?)",
+                            (did, designation, qte, unite, round(montant * part / qte)),
+                        )
+                    n_dv += 1
+
+                cle = f"depenses_demo_{cid}"
+                if not conn.execute("SELECT 1 FROM meta WHERE key = ?", (cle,)).fetchone():
+                    depense_totale = budget * avancement / 100 * 0.92
+                    d0 = date.fromisoformat(debut)
+                    duree = (DATE_REFERENCE_DEMO - d0).days
+                    for c_idx, (categorie, poids, descriptions) in enumerate(DEPENSES_TYPE):
+                        for j, (description, part) in enumerate(zip(descriptions, (0.3, 0.3, 0.4))):
+                            fraction = max(0.05, (j + 1) / 3 - c_idx * 0.04)
+                            jour = (d0 + timedelta(days=int(duree * fraction))).isoformat()
+                            montant = round(depense_totale * poids * part / 1000) * 1000
+                            conn.execute(
+                                "INSERT INTO depenses (chantier_id, categorie, description, montant, date) VALUES (?,?,?,?,?)",
+                                (cid, categorie, description, montant, jour),
+                            )
+                            n_dep += 1
+                    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, '1')", (cle,))
+            conn.commit()
+        except sqlite3.Error as exc:
+            conn.rollback()
+            log.exception("Remplissage des données d'exemple annulé")
+            st.error(f"Opération annulée : {exc}")
+            return 0, 0, 0
+    return n_cl, n_dv, n_dep
+
+
 def ensure_demo_data() -> None:
-    """Au tout premier lancement : crée les 4 chantiers « En cours » avec leurs équipes (une seule fois)."""
+    """Au premier lancement : 4 chantiers « En cours » avec équipes, puis clients, devis et dépenses (une seule fois)."""
     if st.session_state.get("_demo_checked"):
         return
     st.session_state["_demo_checked"] = True
     try:
         ensure_schema()
         conn = get_connection()
-        if conn.execute("SELECT 1 FROM meta WHERE key = 'equipes_demo_v2'").fetchone():
-            return
-        nb = conn.execute("SELECT COUNT(*) FROM chantiers").fetchone()[0]
-        nb_demo = conn.execute("SELECT COUNT(*) FROM chantiers WHERE nom LIKE '%(démo)%'").fetchone()[0]
-        if nb == 0 or nb_demo > 0:  # base vide, ou chantiers d'exemple déjà présents à compléter
-            seed_intervenants_demo()
-        db_write("INSERT OR REPLACE INTO meta (key, value) VALUES ('equipes_demo_v2', '1')")
+
+        def deja_fait(cle: str) -> bool:
+            return conn.execute("SELECT 1 FROM meta WHERE key = ?", (cle,)).fetchone() is not None
+
+        def nb_chantiers(demo_seulement: bool) -> int:
+            sql = "SELECT COUNT(*) FROM chantiers" + (" WHERE nom LIKE '%(démo)%'" if demo_seulement else "")
+            return conn.execute(sql).fetchone()[0]
+
+        if not deja_fait("equipes_demo_v2"):
+            if nb_chantiers(False) == 0 or nb_chantiers(True) > 0:  # base vide, ou exemples à compléter
+                seed_intervenants_demo()
+            db_write("INSERT OR REPLACE INTO meta (key, value) VALUES ('equipes_demo_v2', '1')")
+        if not deja_fait("gestion_demo_v1"):
+            if nb_chantiers(True) > 0:
+                seed_gestion_demo()
+            db_write("INSERT OR REPLACE INTO meta (key, value) VALUES ('gestion_demo_v1', '1')")
     except sqlite3.Error:
         log.exception("Création des données d'exemple impossible")  # ne jamais bloquer l'application
 
@@ -1373,6 +1915,16 @@ def page_intervenants() -> None:
                 st.rerun()
             else:
                 st.info("Les chantiers d'exemple existent déjà avec leurs équipes complètes.")
+        if can_edit():
+            st.divider()
+            st.write("**Clients, devis et dépenses** liés aux 4 chantiers (créés aussi automatiquement au premier lancement).")
+            if st.button("Compléter clients, devis et dépenses", key="seed_gest"):
+                n_cl, n_dv, n_dep = seed_gestion_demo()
+                if n_cl or n_dv or n_dep:
+                    flash(f"{n_cl} client(s), {n_dv} devis et {n_dep} dépense(s) ajoutés.")
+                    st.rerun()
+                else:
+                    st.info("Clients, devis et dépenses d'exemple déjà présents.")
 
 
 # --------------------------------------------------------------------------- #
@@ -2811,6 +3363,9 @@ def main() -> None:
         if st.button("Se déconnecter"):
             logout()
 
+    theme = BANNER_KEYS.get(page.split(' ', 1)[-1])
+    if theme:
+        render_banner(theme)
     try:
         PAGES[page]()
     except Exception as exc:  # noqa: BLE001  - filet de sécurité : ne jamais afficher une page blanche
