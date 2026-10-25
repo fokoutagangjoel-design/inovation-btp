@@ -1171,6 +1171,80 @@ def seed_gestion_demo() -> tuple[int, int, int]:
     return n_cl, n_dv, n_dep
 
 
+# --------------------------------------------------------------------------- #
+# Données d'exemple : stock de matériaux avec entrées et sorties vers les chantiers
+# --------------------------------------------------------------------------- #
+# (nom, unité, prix unitaire, seuil d'alerte, total des entrées, part sortie vers les chantiers)
+# Les 8 premiers noms sont ceux des relevés de prix de l'onglet « Marchés BTP » (comparaison stock / marché).
+DEMO_STOCK = [
+    ("Ciment CPJ 42,5 (sac 50 kg)", "sac", 6500, 200, 4200, 0.96),
+    ("Fer à béton HA12 (barre 12 m)", "u", 8400, 150, 2600, 0.82),
+    ("Fer à béton HA8 (barre 12 m)", "u", 4000, 150, 2200, 0.80),
+    ("Sable de rivière", "m³", 12500, 40, 520, 0.88),
+    ("Gravier 15/25", "m³", 26000, 30, 380, 0.70),
+    ("Parpaing 15 cm", "u", 540, 2000, 38000, 0.75),
+    ("Tube PVC Ø100 (6 m)", "u", 9800, 30, 240, 0.95),
+    ("Peinture vinylique (seau 20 L)", "u", 39000, 10, 90, 0.55),
+    ("Bois de coffrage (planche)", "u", 3500, 100, 1500, 0.72),
+    ("Fil de ligature", "kg", 1200, 60, 700, 0.78),
+    ("Carreaux 40x40", "m²", 6500, 100, 2400, 0.45),
+    ("Câble électrique 2,5 mm² (rouleau)", "u", 24000, 8, 60, 0.70),
+    ("Tôle bac alu (feuille)", "u", 11000, 40, 420, 0.50),
+    ("Gasoil", "L", 750, 300, 6000, 0.90),
+]
+DATES_ENTREES_DEMO = ("2026-06-05", "2026-09-02")
+DATES_SORTIES_DEMO = ("2026-07-14", "2026-08-19", "2026-09-23", "2026-10-12")
+PART_SORTIES_CHANTIERS = (0.35, 0.20, 0.25, 0.20)
+
+
+def seed_stock_demo() -> tuple[int, int]:
+    """Crée 14 matériaux avec leurs mouvements (entrées fournisseurs, sorties vers les 4 chantiers).
+
+    La quantité en stock est exactement la somme des entrées moins les sorties. Retourne
+    (matériaux créés, mouvements créés) ; un matériau déjà présent n'est pas modifié.
+    """
+    conn = get_connection()
+    n_mat = n_mvt = 0
+    with _WRITE_LOCK:
+        try:
+            chantiers = []
+            for ch in DEMO_CHANTIERS:
+                row = conn.execute("SELECT id FROM chantiers WHERE nom = ?", (ch["nom"],)).fetchone()
+                chantiers.append(row[0] if row else None)
+            for nom, unite, prix, seuil, entrees, part_sortie in DEMO_STOCK:
+                if conn.execute("SELECT 1 FROM materiaux WHERE nom = ?", (nom,)).fetchone():
+                    continue
+                e1 = round(entrees * 0.6)
+                mouvements = [("Entrée", None, e1, DATES_ENTREES_DEMO[0], "Livraison fournisseur (exemple)"),
+                              ("Entrée", None, entrees - e1, DATES_ENTREES_DEMO[1], "Livraison fournisseur (exemple)")]
+                a_sortir = round(entrees * part_sortie)
+                reste = a_sortir
+                for k, (cid, part, jour) in enumerate(zip(chantiers, PART_SORTIES_CHANTIERS, DATES_SORTIES_DEMO)):
+                    qte = reste if k == len(chantiers) - 1 else round(a_sortir * part)
+                    reste -= qte
+                    if qte > 0:
+                        mouvements.append(("Sortie", cid, qte, jour, "Sortie vers chantier (exemple)"))
+                quantite = entrees - a_sortir
+                mid = conn.execute(
+                    "INSERT INTO materiaux (nom, unite, quantite, seuil_alerte, prix_unitaire) VALUES (?,?,?,?,?)",
+                    (nom, unite, quantite, seuil, prix),
+                ).lastrowid
+                n_mat += 1
+                for type_mvt, cid, qte, jour, note in mouvements:
+                    conn.execute(
+                        "INSERT INTO mouvements_stock (materiau_id, chantier_id, type, quantite, date, note) VALUES (?,?,?,?,?,?)",
+                        (mid, cid, type_mvt, qte, jour, note),
+                    )
+                    n_mvt += 1
+            conn.commit()
+        except sqlite3.Error as exc:
+            conn.rollback()
+            log.exception("Remplissage du stock d'exemple annulé")
+            st.error(f"Opération annulée : {exc}")
+            return 0, 0
+    return n_mat, n_mvt
+
+
 def ensure_demo_data() -> None:
     """Au premier lancement : 4 chantiers « En cours » avec équipes, puis clients, devis et dépenses (une seule fois)."""
     if st.session_state.get("_demo_checked"):
@@ -1195,6 +1269,10 @@ def ensure_demo_data() -> None:
             if nb_chantiers(True) > 0:
                 seed_gestion_demo()
             db_write("INSERT OR REPLACE INTO meta (key, value) VALUES ('gestion_demo_v1', '1')")
+        if not deja_fait("stock_demo_v1"):
+            if conn.execute("SELECT COUNT(*) FROM materiaux").fetchone()[0] == 0:  # ne touche pas à un stock existant
+                seed_stock_demo()
+            db_write("INSERT OR REPLACE INTO meta (key, value) VALUES ('stock_demo_v1', '1')")
     except sqlite3.Error:
         log.exception("Création des données d'exemple impossible")  # ne jamais bloquer l'application
 
@@ -2940,6 +3018,16 @@ def page_stock() -> None:
             df["alerte"] = df.apply(lambda r: "⚠️ Bas" if r["quantite"] <= r["seuil_alerte"] else "OK", axis=1)
             st.dataframe(df, hide_index=True, use_container_width=True)
             st.metric("Valeur totale du stock", fcfa(df["valeur"].sum()))
+        if can_edit():
+            st.divider()
+            st.caption("Le stock d'exemple (14 matériaux, entrées et sorties vers les 4 chantiers) est créé au premier lancement.")
+            if st.button("Charger / compléter le stock d'exemple", key="seed_stock"):
+                n_mat, n_mvt = seed_stock_demo()
+                if n_mat:
+                    flash(f"{n_mat} matériau(x) et {n_mvt} mouvement(s) ajoutés.")
+                    st.rerun()
+                else:
+                    st.info("Le stock d'exemple est déjà présent.")
 
     with tab_add:
         if not can_edit():
